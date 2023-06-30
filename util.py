@@ -3,6 +3,9 @@ import wget
 import logging
 import urllib.error
 import os.path
+import random
+import glob
+from moviepy.editor import VideoFileClip
 
 def parse_time(x):
     pat = x.split()
@@ -25,6 +28,18 @@ def total_runtime():
     total = sum(parse_time(x['runtime']) for x in data if len(x['runtime'])>0)
     print(f"Total runtime: {total:0.2f} hours")
 
+def total_runtime_on_disk():
+    logging.getLogger().setLevel(logging.INFO)
+    total = 0
+    for f in glob.glob("data/out/cinedantan/*/*.mp4"):
+        try:
+            clip = VideoFileClip(f)
+            total += clip.duration
+            logging.info(f"{round(clip.duration):}\t{f}")
+        except UnicodeDecodeError:
+            pass
+    print(f"Total runtime on disk:  {total/3600:0.2f} hours.")
+    
 def get_formats(urls):
     D = {}
     for url in urls:
@@ -54,9 +69,11 @@ def _download():
 
 formats = ['h.264', '512Kb MPEG4', '256Kb MPEG4']
 
-def download():
+def download(shuffle=False):
     from internetarchive import get_session
     data = json.load(open("data/in/cinedantan_movies.json"))
+    if shuffle:
+        data = sorted(data, key=lambda _: random.random())
     s = get_session()
     for film in data:
         logging.info(f"Processing {film['identifier']}")
@@ -74,5 +91,5 @@ def download():
                     
 if __name__ == '__main__':
     logging.getLogger().setLevel(logging.INFO)
-    download()
+    download(True)
     
