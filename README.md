@@ -27,5 +27,8 @@ Data: https://movienet.github.io/#!
 Only annotations available so far.
 
 
+### Condensed movies
+
+Data: https://github.com/m-bain/CondensedMovies/tree/master
 
 
