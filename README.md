@@ -11,6 +11,7 @@ Public domain movies, mainly from internetarchive.
 - Number of movies: +2100
 - Total duration: 2437 hours
 - Total runtime downloaded on disk: 2158.67 hours.
+- Size on disk: 705G
 
 ### Large Scale Movie Description Challenge (LSMDC)
 
