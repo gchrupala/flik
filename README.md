@@ -8,7 +8,7 @@ Data: https://github.com/casbah-ma/cinedantan/blob/master/public/database/movies
 
 Number of movies: +2100
 Total duration: 2437 hours
-Total runtime on disk:  694.06 hours.
+Total runtime on disk: 2158.67 hours.
 
 ### Large Scale Movie Description Challenge (LSMDC)
 Data: https://sites.google.com/site/describingmovies/download?authuser=0
