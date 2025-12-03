@@ -6,6 +6,7 @@
 ### Cinedantan
 
 Data: https://github.com/casbah-ma/cinedantan/blob/master/public/database/movies.json
+
 Public domain movies, mainly from internetarchive.
 
 - Number of movies: +2100
@@ -22,7 +23,8 @@ Seems like very short clips, no dialog.
 ### MSRVTT
 Data: https://cove.thecvf.com/datasets/839
 
-Web video clips
+Web video clips.
+
 Total duration: 41.2 hours
 
 ### Movienet
