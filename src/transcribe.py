@@ -24,7 +24,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join(PROJECT_ROOT, "transcribe.log")),
+        logging.FileHandler(os.path.join(PROJECT_ROOT, "logdir/transcribe.log")),
         logging.StreamHandler(),
     ],
 )
@@ -32,11 +32,21 @@ logger = logging.getLogger(__name__)
 
 
 def process_video(video_path, output_path, model, align_model, metadata):
+    base_name = os.path.basename(video_path)
+    file_name = os.path.splitext(base_name)[0]
+    alignment_output_path = os.path.join(output_path, f"{file_name}.json")
+
+    if os.path.isfile(alignment_output_path):
+        logger.info(f"Skipping (already processed): {video_path}")
+        return
+
     logger.info(f"Processing: {video_path}")
 
     # 1. Transcribe with original whisper (batched)
     audio = whisperx.load_audio(video_path)
     result = model.transcribe(audio, batch_size=BATCH_SIZE)
+
+    language_code = result["language"]
 
     # 2. Align whisper output
     # This aligns the text segments to the audio waveforms for word-level precision
@@ -49,23 +59,25 @@ def process_video(video_path, output_path, model, align_model, metadata):
         return_char_alignments=False,
     )
 
-    # Optional: cleanup audio memory
+    # Cleanup audio memory
     del audio
+    gc.collect()
+    torch.cuda.empty_cache()
 
-    # 3. Save results
-    base_name = os.path.basename(video_path)
-    file_name = os.path.splitext(base_name)[0]
-
-    # Save as JSON (best for data analysis/search)
-    with open(
-        os.path.join(output_path, f"{file_name}.json"), "w", encoding="utf-8"
-    ) as f:
+    # Save transcription as JSON (best for data analysis/search)
+    with open(alignment_output_path, "w", encoding="utf-8") as f:
         json.dump(result_aligned["segments"], f, indent=2, ensure_ascii=False)
 
     # Helper: Save as SRT (if you want to watch the alignment)
     save_as_srt(
         result_aligned["segments"], os.path.join(output_path, f"{file_name}.srt")
     )
+
+    # Save language info to text file
+    with open(
+        os.path.join(output_path, f"{file_name}_language.txt"), "w", encoding="utf-8"
+    ) as f:
+        f.write(language_code)
 
     logger.info(f"Done: {file_name}")
 
@@ -107,6 +119,8 @@ def main():
         pattern = os.path.join(SOURCE_FOLDER, "**", f"*{ext.upper()}")
         files_to_process.extend(glob.glob(pattern, recursive=True))
 
+    logger.info(f"Found {len(files_to_process)} video files to process.")
+
     if not files_to_process:
         logger.info("No video files found.")
         return
@@ -123,17 +137,9 @@ def main():
                 OUTPUT_FOLDER,
                 os.path.relpath(os.path.dirname(video_file), SOURCE_FOLDER),
             )
-            if not os.path.exists(output_path):
-                os.makedirs(output_path, exist_ok=True)
-            else:
-                # Check if path is empty (skip if already processed)
-                if os.listdir(output_path):
-                    logger.info(f"Skipping already processed file: {video_file}")
-                    continue
-                process_video(video_file, output_path, model, align_model, metadata)
-                # Force garbage collection to prevent VRAM accumulation
-                gc.collect()
-                torch.cuda.empty_cache()
+            os.makedirs(output_path, exist_ok=True)
+
+            process_video(video_file, output_path, model, align_model, metadata)
 
         except Exception as e:
             logger.error(f"Error processing {video_file}: {e}")
