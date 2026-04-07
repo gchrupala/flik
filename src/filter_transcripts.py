@@ -7,18 +7,13 @@ import re
 from langdetect import LangDetectException, detect, detect_langs
 from tqdm.auto import tqdm
 
-# Config
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TRANSCRIPT_ROOT = os.path.join(PROJECT_ROOT, "data/transcripts")
-VIDEO_ROOT = os.path.join(
-    PROJECT_ROOT, "data/out/cinedantan"
-)  # Where the actual video files is stored
-OUTPUT_MANIFEST = os.path.join(PROJECT_ROOT, "data/batch_manifest.json")
-
-# How many characters to sample to speed up detection?
-# 2000 chars is usually enough to be certain of the language without reading the whole file.
-SAMPLE_SIZE = 2000
-
+from CONSTANTS import (
+    CHAR_SAMPLE_SIZE,
+    OUTPUT_MANIFEST,
+    PROJECT_ROOT,
+    TRANSCRIPT_ROOT,
+    VIDEO_ROOT,
+)
 
 # Set up logging
 logging.basicConfig(
@@ -82,8 +77,8 @@ def is_english_content(text):
         # We take a slice of the text to speed up processing
         # Using the middle of the text is often safer than the start (intros/music)
         mid_point = len(text) // 2
-        start = max(0, mid_point - (SAMPLE_SIZE // 2))
-        end = min(len(text), mid_point + (SAMPLE_SIZE // 2))
+        start = max(0, mid_point - (CHAR_SAMPLE_SIZE // 2))
+        end = min(len(text), mid_point + (CHAR_SAMPLE_SIZE // 2))
         sample = text[start:end]
 
         # Detect
@@ -110,9 +105,36 @@ def find_video_file(base_name, search_root):
     return None
 
 
+def check_transcript_language(srt_path: str) -> bool:
+    """Checks the language of the transcript using the _language.txt file.
+    The file is expected to be in the same directory as the .srt transcript
+    with the same base name.
+    Args:
+        srt_path (str): Path to the transcript srt file.
+    Returns:
+        bool: True if the language is English, False otherwise.
+    """
+
+    language_txt = srt_path.replace(".srt", "_language.txt")
+    if not os.path.isfile(language_txt):
+        return False
+    try:
+        with open(language_txt, "r", encoding="utf-8") as f:
+            lang = f.read().strip().lower()
+            return lang == "en" or lang.startswith("en-")
+    except Exception as e:
+        logger.warning(f"Could not read language file {language_txt}: {e}")
+        return False
+
+
 def main():
     valid_pairs = []
-    skipped_count = 0
+    skipped_reason = {
+        "non_english": 0,
+        "missing_json": 0,
+        "video_not_found": 0,
+        "misc_error": 0,
+    }
 
     # Get all SRT files with glob
     logger.info("Scanning for SRT files...")
@@ -123,48 +145,50 @@ def main():
     logger.info(f"Found {len(all_srt_files)} SRT files. Processing...")
 
     for srt_file in tqdm(all_srt_files, desc="Processing SRTs"):
-        text_content = parse_srt_to_text(srt_file)
+        # First check the Whisperx language ID output to see if the transcript is English
+        if not check_transcript_language(srt_file):
+            logger.warning(
+                f"Skipping {srt_file}: Non-English content detected via language file."
+            )
+            skipped_reason["non_english"] += 1
+            continue
 
-        # Check if English
-        if is_english_content(text_content):
-            base_name = os.path.splitext(os.path.basename(srt_file))[0]
-            json_path = srt_file.replace(".srt", ".json")
+        base_name = os.path.splitext(os.path.basename(srt_file))[0]
+        json_path = srt_file.replace(".srt", ".json")
 
-            if os.path.isfile(json_path):
-                video_dir = os.path.dirname(
-                    json_path.replace(TRANSCRIPT_ROOT, VIDEO_ROOT)
-                )
-                if os.path.isdir(video_dir):
-                    for root, _, files in os.walk(video_dir):
-                        for file in files:
-                            if file.rsplit(".", 1)[0] == base_name and file.endswith(
-                                (".mp4", ".mkv", ".avi", ".mov", ".webm")
-                            ):
-                                video_path = os.path.join(root, file)
+        if os.path.isfile(json_path):
+            video_dir = os.path.dirname(json_path.replace(TRANSCRIPT_ROOT, VIDEO_ROOT))
+            if os.path.isdir(video_dir):
+                for root, _, files in os.walk(video_dir):
+                    for file in files:
+                        if file.rsplit(".", 1)[0] == base_name and file.endswith(
+                            (".mp4", ".mkv", ".avi", ".mov", ".webm")
+                        ):
+                            video_path = os.path.join(root, file)
 
-                                valid_pairs.append(
-                                    {
-                                        "id": base_name,
-                                        "video_path": video_path,
-                                        "json_path": json_path,  # We pass the JSON to the next step
-                                        "srt_path": srt_file,  # Kept for reference
-                                    }
-                                )
-                                break
+                            valid_pairs.append(
+                                {
+                                    "id": base_name,
+                                    "video_path": video_path,
+                                    "json_path": json_path,  # We pass the JSON to the next step
+                                    "srt_path": srt_file,  # Kept for reference
+                                }
+                            )
+                            break
 
-                else:
-                    logger.warning(f"Skipping {base_name}: Video not found.")
-                    skipped_count += 1
             else:
-                logger.warning(f"Skipping {base_name}: Found SRT but missing JSON.")
-                skipped_count += 1
+                logger.warning(f"Skipping {base_name}: Video not found.")
+                skipped_reason["video_not_found"] += 1
         else:
-            logger.warning(f"Skipping {srt_file}: Non-English content detected.")
-            skipped_count += 1
+            logger.warning(f"Skipping {base_name}: Found SRT but missing JSON.")
+            skipped_reason["missing_json"] += 1
 
     logger.info("\nScan complete.")
     logger.info(f"Valid English pairs: {len(valid_pairs)}")
-    logger.info(f"Skipped/Foreign: {skipped_count}")
+    logger.info(f"Skipped/Non-English: {skipped_reason['non_english']}")
+    logger.info(f"Skipped/Missing JSON: {skipped_reason['missing_json']}")
+    logger.info(f"Skipped/Video Not Found: {skipped_reason['video_not_found']}")
+    logger.info(f"Skipped/Misc Errors: {skipped_reason['misc_error']}")
 
     with open(OUTPUT_MANIFEST, "w", encoding="utf-8") as f:
         json.dump(valid_pairs, f, indent=2)
