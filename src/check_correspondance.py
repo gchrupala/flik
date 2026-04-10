@@ -17,12 +17,16 @@ from CONSTANTS import (
     PROJECT_ROOT,
     OUTPUT_MANIFEST as MANIFEST_FILE,
     ALIGNMENT_SCORES_FILE as OUTPUT_FILE,
+    RANDOM_BASELINE_STATS_FILE,
     SAMPLES_PER_VIDEO,
     TARGET_FPS,
     CLIP_MODEL,
     CLIP_TOKEN_LIMIT,
     DEFAULT_FPS,
     MIN_STRIDE,
+    SEGMENT_PERCENTILE_THRESHOLD,
+    VIDEO_PERCENTILE_THRESHOLD,
+    USE_SEGMENT_FILTER,
 )
 
 DEVICE = (
@@ -182,6 +186,14 @@ def main():
     model = CLIPModel.from_pretrained(CLIP_MODEL).to(DEVICE)
     processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
 
+    # Load random baseline scores for normalization
+    random_scores = load_random_scores()
+    if random_scores is None:
+        logger.warning(
+            "Random baseline scores not found. Normalized scores will not be computed."
+        )
+        random_scores = []
+
     results = []
 
     # 2. Process Loop
@@ -204,7 +216,10 @@ def main():
                 valid_segs, min(SAMPLES_PER_VIDEO, len(valid_segs))
             )
 
-            segment_scores = []
+            segment_scores_raw = []
+            segment_scores_z = []
+            segment_scores_percentile = []
+            segment_passed = []
 
             for seg in selected:
                 frames = load_video_frames(
@@ -242,17 +257,68 @@ def main():
 
                 # logits_per_image: [1, num_frames]
                 # We want the max alignment per segment (did the frame match the text at any point?)
-                score = out.logits_per_image.max().item()
-                segment_scores.append(score)
+                score_raw = out.logits_per_image.max().item()
+                segment_scores_raw.append(score_raw)
 
-            avg_score = np.mean(segment_scores) if segment_scores else 0.0
+                # Compute normalized scores if random baseline available
+                if random_scores:
+                    z, perc = compute_normalized_scores(score_raw, random_scores)
+                    segment_scores_z.append(z)
+                    segment_scores_percentile.append(perc)
+                    # Determine if segment passes threshold
+                    if USE_SEGMENT_FILTER:
+                        segment_passed.append(perc >= SEGMENT_PERCENTILE_THRESHOLD)
+                    else:
+                        segment_passed.append(True)  # Not filtering, treat as passed
+                else:
+                    segment_scores_z.append(None)
+                    segment_scores_percentile.append(None)
+                    segment_passed.append(True)  # No baseline, cannot filter
+
+            avg_score_raw = np.mean(segment_scores_raw) if segment_scores_raw else 0.0
+            avg_score_z = None
+            avg_score_percentile = None
+            if random_scores:
+                avg_score_z, avg_score_percentile = compute_normalized_scores(
+                    avg_score_raw, random_scores
+                )
+
+            # Video-level pass criteria
+            video_passed_by_percentile = False
+            video_passed_by_segment_fraction = False
+            if random_scores and avg_score_percentile is not None:
+                video_passed_by_percentile = (
+                    avg_score_percentile >= VIDEO_PERCENTILE_THRESHOLD
+                )
+            if segment_passed:
+                fraction_passed = sum(segment_passed) / len(segment_passed)
+                video_passed_by_segment_fraction = (
+                    fraction_passed >= 0.5
+                )  # at least half of segments pass
 
             results.append(
                 {
                     "id": task["id"],
                     "video_path": task["video_path"],
-                    "avg_clip_score": round(avg_score, 4),
-                    "detail_scores": [round(s, 2) for s in segment_scores],
+                    "avg_clip_score": round(avg_score_raw, 4),  # backward compatibility
+                    "avg_clip_score_raw": round(avg_score_raw, 4),
+                    "avg_clip_score_z": round(avg_score_z, 4)
+                    if avg_score_z is not None
+                    else None,
+                    "avg_clip_score_percentile": round(avg_score_percentile, 2)
+                    if avg_score_percentile is not None
+                    else None,
+                    "segment_scores_raw": [round(s, 4) for s in segment_scores_raw],
+                    "segment_scores_z": [
+                        round(z, 4) if z is not None else None for z in segment_scores_z
+                    ],
+                    "segment_scores_percentile": [
+                        round(p, 2) if p is not None else None
+                        for p in segment_scores_percentile
+                    ],
+                    "segment_passed": segment_passed,
+                    "video_passed_by_percentile": video_passed_by_percentile,
+                    "video_passed_by_segment_fraction": video_passed_by_segment_fraction,
                 }
             )
 
@@ -365,18 +431,50 @@ def check_output():
         alignment_score = json.load(f)
 
     import pandas as pd
+    import numpy as np
 
-    alignment_score_df = pd.DataFrame(alignment_score)
+    df = pd.DataFrame(alignment_score)
     # Ignore the 0 scores
-    alignment_score_df = alignment_score_df[alignment_score_df["avg_clip_score"] > 0.0]
+    df = df[df["avg_clip_score_raw"] > 0.0].copy()
 
-    # Order the df with avg_clip_score
-    alignment_score_df = alignment_score_df.sort_values(
-        by=["avg_clip_score"], ascending=False
-    ).reset_index(drop=True)
+    # Compute additional statistics
+    print("=== Raw CLIP scores (max segment alignment) ===")
+    print(df["avg_clip_score_raw"].describe())
 
-    # Check the statistics of the alignments scores:
-    print(alignment_score_df["avg_clip_score"].describe())
+    if "avg_clip_score_z" in df.columns:
+        print("\n=== Z-scores (relative to random baseline) ===")
+        print(df["avg_clip_score_z"].describe())
+
+        # Percentage of videos with z > 0 (better than random mean)
+        z_positive = (df["avg_clip_score_z"] > 0).sum()
+        print(
+            f"Videos better than random mean (z > 0): {z_positive}/{len(df)} ({z_positive / len(df) * 100:.1f}%)"
+        )
+
+    if "avg_clip_score_percentile" in df.columns:
+        print("\n=== Percentiles (relative to random baseline) ===")
+        print(df["avg_clip_score_percentile"].describe())
+
+        # Count by percentile bins
+        bins = [0, 25, 50, 75, 95, 100]
+        labels = ["0-25", "25-50", "50-75", "75-95", "95-100"]
+        if df["avg_clip_score_percentile"].notna().any():
+            df["percentile_bin"] = pd.cut(
+                df["avg_clip_score_percentile"],
+                bins=bins,
+                labels=labels,
+                include_lowest=True,
+            )
+            print("\nPercentile distribution:")
+            print(df["percentile_bin"].value_counts().sort_index())
+
+    # Top 10 videos by raw score
+    print("\n=== Top 10 videos by raw CLIP score ===")
+    top_raw = df.sort_values("avg_clip_score_raw", ascending=False).head(10)
+    for _, row in top_raw.iterrows():
+        print(
+            f"{row['id']}: raw={row['avg_clip_score_raw']:.3f}, z={row.get('avg_clip_score_z', 'NA')}, percentile={row.get('avg_clip_score_percentile', 'NA')}"
+        )
 
 
 def check_coco_clip_scores():
@@ -398,6 +496,95 @@ def check_coco_clip_scores():
 
     print("\nRandom Image-to-Text CLIP Scores:")
     print(random_itt_df["clip_score"].describe())
+
+
+def compute_random_baseline_stats():
+    """
+    Compute statistics (mean, std, percentiles) from the randomized alignment scores
+    and save to RANDOM_BASELINE_STATS_FILE.
+    """
+    randomized_file = OUTPUT_FILE.replace(".json", "_randomized.json")
+    if not os.path.exists(randomized_file):
+        logger.warning(
+            f"Randomized scores file {randomized_file} not found. Run with --mode randomized first."
+        )
+        return None
+
+    with open(randomized_file, "r") as f:
+        random_scores = json.load(f)
+
+    if not random_scores:
+        logger.warning("Randomized scores list is empty.")
+        return None
+
+    stats = {
+        "mean": float(np.mean(random_scores)),
+        "std": float(np.std(random_scores)),
+        "min": float(np.min(random_scores)),
+        "max": float(np.max(random_scores)),
+        "percentiles": {
+            "p5": float(np.percentile(random_scores, 5)),
+            "p25": float(np.percentile(random_scores, 25)),
+            "p50": float(np.percentile(random_scores, 50)),
+            "p75": float(np.percentile(random_scores, 75)),
+            "p95": float(np.percentile(random_scores, 95)),
+        },
+        "count": len(random_scores),
+    }
+
+    with open(RANDOM_BASELINE_STATS_FILE, "w") as f:
+        json.dump(stats, f, indent=2)
+
+    logger.info(f"Random baseline stats saved to {RANDOM_BASELINE_STATS_FILE}")
+    return stats
+
+
+def load_baseline_stats(compute_if_missing=True):
+    """
+    Load random baseline stats from file. If missing, optionally compute them.
+    Returns dict or None.
+    """
+    if os.path.exists(RANDOM_BASELINE_STATS_FILE):
+        with open(RANDOM_BASELINE_STATS_FILE, "r") as f:
+            return json.load(f)
+
+    if compute_if_missing:
+        logger.info("Random baseline stats not found, computing...")
+        return compute_random_baseline_stats()
+
+    return None
+
+
+def load_random_scores():
+    """
+    Load the raw randomized scores from the randomized JSON file.
+    Returns list of floats or None if file missing.
+    """
+    randomized_file = OUTPUT_FILE.replace(".json", "_randomized.json")
+    if not os.path.exists(randomized_file):
+        logger.warning(f"Randomized scores file {randomized_file} not found.")
+        return None
+    with open(randomized_file, "r") as f:
+        return json.load(f)
+
+
+def compute_normalized_scores(raw_score, random_scores):
+    """
+    Compute z-score and percentile rank of raw_score relative to random_scores.
+    Returns (z_score, percentile) where percentile is percentage of random scores <= raw_score.
+    """
+    if not random_scores:
+        return None, None
+    mean = np.mean(random_scores)
+    std = np.std(random_scores)
+    z_score = (raw_score - mean) / std if std != 0 else 0.0
+
+    # Compute percentile: proportion of random scores <= raw_score
+    sorted_random = np.sort(random_scores)
+    percentile = (
+        np.searchsorted(sorted_random, raw_score) / len(random_scores)
+    ) * 100.0
+    return float(z_score), float(percentile)
 
 
 if __name__ == "__main__":

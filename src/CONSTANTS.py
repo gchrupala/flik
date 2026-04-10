@@ -3,12 +3,19 @@ import os
 
 # Config
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TRANSCRIPT_ROOT = os.path.join(PROJECT_ROOT, "data/transcripts")
-VIDEO_ROOT = os.path.join(
-    PROJECT_ROOT, "data/out/cinedantan"
-)  # Where the actual video files is stored
+# Check if we're running on snellius and set paths accordingly
+hostname = os.uname().nodename
+if "snellius" in hostname:
+    TRANSCRIPT_ROOT = os.path.join(PROJECT_ROOT, "data/out")
+    VIDEO_ROOT = os.path.join(PROJECT_ROOT, "data/out")
+else:
+    TRANSCRIPT_ROOT = os.path.join(PROJECT_ROOT, "data/transcripts")
+    VIDEO_ROOT = os.path.join(PROJECT_ROOT, "data/videos")
 OUTPUT_MANIFEST = os.path.join(PROJECT_ROOT, "data/batch_manifest.json")
 ALIGNMENT_SCORES_FILE = os.path.join(PROJECT_ROOT, "data/alignment_scores.json")
+RANDOM_BASELINE_STATS_FILE = os.path.join(
+    PROJECT_ROOT, "data/clip_random_baseline_stats.json"
+)
 
 # How many characters to sample to speed up detection?
 # 2000 chars is usually enough to be certain of the language without reading the whole file.
@@ -25,6 +32,9 @@ ALIGNMENT_LANGUAGE = "en"
 CLIP_MODEL = "openai/clip-vit-base-patch32"
 SAMPLES_PER_VIDEO = 5
 TARGET_FPS = 3
+SEGMENT_PERCENTILE_THRESHOLD = 25  # Lenient threshold for segment-level filtering
+VIDEO_PERCENTILE_THRESHOLD = 25  # Lenient threshold for video-level filtering
+USE_SEGMENT_FILTER = False  # Whether to apply segment-level filtering
 
 # Video file extensions
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".webm")
