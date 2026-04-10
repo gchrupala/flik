@@ -1,5 +1,8 @@
 logdir/*
 data/*
+uv.lock
+AGENTS.md
+
 
 
 # Byte-compiled / optimized / DLL files
