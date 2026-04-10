@@ -1,4 +1,5 @@
 # Take snippet from video at random intervals according to the srt file and check if the content of the video frames correspond to the transcription
+import argparse
 import json
 import logging
 import os
@@ -12,17 +13,23 @@ from tqdm.auto import tqdm
 from transformers import CLIPModel, CLIPProcessor
 
 # Config
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MANIFEST_FILE = os.path.join(PROJECT_ROOT, "data/batch_manifest.json")
-OUTPUT_FILE = os.path.join(PROJECT_ROOT, "data/alignment_scores.json")
-SAMPLES_PER_VIDEO = 5
-TARGET_FPS = 3  # Downsample
+from CONSTANTS import (
+    PROJECT_ROOT,
+    OUTPUT_MANIFEST as MANIFEST_FILE,
+    ALIGNMENT_SCORES_FILE as OUTPUT_FILE,
+    SAMPLES_PER_VIDEO,
+    TARGET_FPS,
+    CLIP_MODEL,
+    CLIP_TOKEN_LIMIT,
+    DEFAULT_FPS,
+    MIN_STRIDE,
+)
+
 DEVICE = (
     torch.accelerator.current_accelerator()
     if torch.accelerator.is_available()
     else torch.device("cpu")
 )
-CLIP_MODEL = "openai/clip-vit-base-patch32"
 
 # Set up logging
 logging.basicConfig(
@@ -38,7 +45,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_video_frames(video_path, start_sec, end_sec, target_fps=3):
+def load_video_frames(video_path, start_sec, end_sec, target_fps=TARGET_FPS):
     frames = []
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -46,11 +53,11 @@ def load_video_frames(video_path, start_sec, end_sec, target_fps=3):
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
-        fps = 24
+        fps = DEFAULT_FPS
 
     start_frame = int(start_sec * fps)
     end_frame = int(end_sec * fps)
-    stride = max(1, int(round(fps / target_fps)))
+    stride = max(MIN_STRIDE, int(round(fps / target_fps)))
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     current_pos = start_frame
@@ -107,7 +114,7 @@ def establish_clip_score_baseline():
     matched_scores = {"text-to-image": [], "image-to-text": []}
     for item in tqdm(dataset, desc="Computing matched scores"):
         image = Image.open(item["image_path"]).convert("RGB")
-        caption = item["caption"][:77]  # CLIP limit
+        caption = item["caption"][:CLIP_TOKEN_LIMIT]  # CLIP limit
 
         inputs = processor(
             text=[caption], images=[image], return_tensors="pt", padding=True
@@ -134,7 +141,7 @@ def establish_clip_score_baseline():
         "text-to-image": [],
         "image-to-text": [],
     }
-    captions = [item["caption"][:77] for item in dataset]
+    captions = [item["caption"][:CLIP_TOKEN_LIMIT] for item in dataset]
     for item in tqdm(dataset, desc="Computing random scores"):
         image = Image.open(item["image_path"]).convert("RGB")
         random_caption = random.choice(captions)
@@ -207,7 +214,7 @@ def main():
                 if not frames:
                     continue
 
-                text_input = seg["text"][:77]  # CLIP limit
+                text_input = seg["text"][:CLIP_TOKEN_LIMIT]  # CLIP limit
 
                 # # For debug only we show the frames in a 6x6 grid
                 # grid_size = (6, 6)
@@ -301,7 +308,7 @@ def check_randomized():
             if not frames:
                 continue
 
-            text_input = seg["text"][:77]  # CLIP limit
+            text_input = seg["text"][:CLIP_TOKEN_LIMIT]  # CLIP limit
 
             # Save the input to lists
             all_text_input.append(text_input)
@@ -394,5 +401,42 @@ def check_coco_clip_scores():
 
 
 if __name__ == "__main__":
-    # main()
-    check_randomized()
+    parser = argparse.ArgumentParser(
+        description="Check video-text correspondence using CLIP"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["cuda", "cpu"],
+        default=None,
+        help="Device to use (cuda/cpu). Default: auto-detect using torch.accelerator",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["main", "randomized", "output", "coco"],
+        default="randomized",
+        help="Which function to run: main (alignment), randomized (random pairs), output (stats), coco (baseline)",
+    )
+    args = parser.parse_args()
+
+    # Override DEVICE if specified
+    if args.device is not None:
+        if args.device == "cuda":
+            if torch.cuda.is_available():
+                DEVICE = torch.device("cuda")
+            else:
+                logger.warning("CUDA requested but not available, using CPU")
+                DEVICE = torch.device("cpu")
+        else:
+            DEVICE = torch.device("cpu")
+        logger.info(f"Using device: {DEVICE}")
+
+    if args.mode == "main":
+        main()
+    elif args.mode == "randomized":
+        check_randomized()
+    elif args.mode == "output":
+        check_output()
+    elif args.mode == "coco":
+        check_coco_clip_scores()

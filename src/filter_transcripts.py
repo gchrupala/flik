@@ -9,10 +9,14 @@ from tqdm.auto import tqdm
 
 from CONSTANTS import (
     CHAR_SAMPLE_SIZE,
+    ENGLISH_LANGUAGE_CODE,
+    ENGLISH_LANGUAGE_PREFIX,
+    MIN_TEXT_LENGTH_FOR_DETECTION,
     OUTPUT_MANIFEST,
     PROJECT_ROOT,
     TRANSCRIPT_ROOT,
     VIDEO_ROOT,
+    VIDEO_EXTENSIONS,
 )
 
 # Set up logging
@@ -70,7 +74,7 @@ def is_english_content(text):
     """
     Uses langdetect to verify text is English.
     """
-    if len(text) < 50:
+    if len(text) < MIN_TEXT_LENGTH_FOR_DETECTION:
         return False  # Too short to decide
 
     try:
@@ -83,14 +87,14 @@ def is_english_content(text):
 
         # Detect
         lang = detect(sample)
-        return lang == "en"
+        return lang == ENGLISH_LANGUAGE_CODE
 
     except LangDetectException:
         return False
 
 
 def find_video_file(base_name, search_root):
-    extensions = [".mp4", ".mkv", ".avi", ".mov", ".webm"]
+    extensions = list(VIDEO_EXTENSIONS)
     for ext in extensions:
         # Direct check
         path = os.path.join(search_root, base_name + ext)
@@ -121,7 +125,9 @@ def check_transcript_language(srt_path: str) -> bool:
     try:
         with open(language_txt, "r", encoding="utf-8") as f:
             lang = f.read().strip().lower()
-            return lang == "en" or lang.startswith("en-")
+            return lang == ENGLISH_LANGUAGE_CODE or lang.startswith(
+                ENGLISH_LANGUAGE_PREFIX
+            )
     except Exception as e:
         logger.warning(f"Could not read language file {language_txt}: {e}")
         return False
@@ -162,7 +168,7 @@ def main():
                 for root, _, files in os.walk(video_dir):
                     for file in files:
                         if file.rsplit(".", 1)[0] == base_name and file.endswith(
-                            (".mp4", ".mkv", ".avi", ".mov", ".webm")
+                            VIDEO_EXTENSIONS
                         ):
                             video_path = os.path.join(root, file)
 

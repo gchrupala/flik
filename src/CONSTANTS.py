@@ -8,10 +8,38 @@ VIDEO_ROOT = os.path.join(
     PROJECT_ROOT, "data/out/cinedantan"
 )  # Where the actual video files is stored
 OUTPUT_MANIFEST = os.path.join(PROJECT_ROOT, "data/batch_manifest.json")
+ALIGNMENT_SCORES_FILE = os.path.join(PROJECT_ROOT, "data/alignment_scores.json")
 
 # How many characters to sample to speed up detection?
 # 2000 chars is usually enough to be certain of the language without reading the whole file.
 CHAR_SAMPLE_SIZE = 2000
+
+# Transcription (WhisperX) constants
+WHISPER_DEVICE = "cuda"  # Default device; scripts dynamically detect CUDA availability
+WHISPER_BATCH_SIZE = 16
+WHISPER_COMPUTE_TYPE = "float16"
+WHISPER_MODEL = "large-v3"
+ALIGNMENT_LANGUAGE = "en"
+
+# CLIP alignment constants
+CLIP_MODEL = "openai/clip-vit-base-patch32"
+SAMPLES_PER_VIDEO = 5
+TARGET_FPS = 3
+
+# Video file extensions
+VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".webm")
+
+# Language detection constants
+MIN_TEXT_LENGTH_FOR_DETECTION = 50
+ENGLISH_LANGUAGE_CODE = "en"
+ENGLISH_LANGUAGE_PREFIX = "en-"
+
+# CLIP model constants
+CLIP_TOKEN_LIMIT = 77
+
+# Video processing constants
+DEFAULT_FPS = 24
+MIN_STRIDE = 1
 
 
 def calculate_total_duration(json_path: str = OUTPUT_MANIFEST) -> None:

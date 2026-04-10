@@ -1,3 +1,4 @@
+import argparse
 import gc
 import glob
 import json
@@ -8,16 +9,19 @@ import torch
 import whisperx
 from tqdm import tqdm
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from CONSTANTS import (
+    PROJECT_ROOT,
+    VIDEO_ROOT as SOURCE_FOLDER,
+    TRANSCRIPT_ROOT as OUTPUT_FOLDER,
+    WHISPER_BATCH_SIZE as BATCH_SIZE,
+    WHISPER_COMPUTE_TYPE as COMPUTE_TYPE,
+    WHISPER_MODEL,
+    ALIGNMENT_LANGUAGE,
+    VIDEO_EXTENSIONS,
+)
 
-# Configuration
-SOURCE_FOLDER = os.path.join(
-    PROJECT_ROOT, "data/out/cinedantan/"
-)  # Where your video files are
-OUTPUT_FOLDER = os.path.join(PROJECT_ROOT, "data/transcripts")  # Where to save results
-DEVICE = "cuda"
-BATCH_SIZE = 16  # Reduce if you run out of VRAM
-COMPUTE_TYPE = "float16"  # Change to "int8" if you have older GPU/low VRAM
+# Device detection
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Set up logging
 logging.basicConfig(
@@ -31,7 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def process_video(video_path, output_path, model, align_model, metadata):
+def process_video(video_path, output_path, model, align_model, metadata, device):
     base_name = os.path.basename(video_path)
     file_name = os.path.splitext(base_name)[0]
     alignment_output_path = os.path.join(output_path, f"{file_name}.json")
@@ -55,14 +59,15 @@ def process_video(video_path, output_path, model, align_model, metadata):
         align_model,
         metadata,
         audio,
-        DEVICE,
+        device,
         return_char_alignments=False,
     )
 
     # Cleanup audio memory
     del audio
     gc.collect()
-    torch.cuda.empty_cache()
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Save transcription as JSON (best for data analysis/search)
     with open(alignment_output_path, "w", encoding="utf-8") as f:
@@ -99,18 +104,38 @@ def save_as_srt(segments, output_file):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Transcribe videos using WhisperX")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=DEVICE,
+        help=f"Device to use for inference (default: {DEVICE})",
+    )
+    args = parser.parse_args()
+
+    device = args.device
+    if device not in ["cuda", "cpu"]:
+        logger.warning(f"Device '{device}' not recognized, defaulting to 'cpu'")
+        device = "cpu"
+
+    if device == "cuda" and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available, falling back to CPU")
+        device = "cpu"
+
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER)
+
+    logger.info(f"Using device: {device}")
 
     # 1. Load Whisper Model
     # Options: "tiny", "base", "small", "medium", "large-v2", "large-v3"
     logger.info("Loading Whisper model...")
-    model = whisperx.load_model("large-v3", DEVICE, compute_type=COMPUTE_TYPE)
+    model = whisperx.load_model(WHISPER_MODEL, device, compute_type=COMPUTE_TYPE)
 
     # 2. Process Files
     logger.info("Searching for video files...")
     # We walk through the directory to find video files
-    video_extensions = (".mp4", ".mkv", ".avi", ".mov")
+    video_extensions = VIDEO_EXTENSIONS
 
     files_to_process = []
     for ext in video_extensions:
@@ -129,7 +154,9 @@ def main():
     # Note: If your movies are mixed languages, you might need to handle language code dynamically per file.
     logger.info("Loading Alignment model...")
     # This loads a localized Wav2Vec2 model for timestamp alignment
-    align_model, metadata = whisperx.load_align_model(language_code="en", device=DEVICE)
+    align_model, metadata = whisperx.load_align_model(
+        language_code=ALIGNMENT_LANGUAGE, device=device
+    )
 
     for video_file in tqdm(files_to_process, desc="Processing videos"):
         try:
@@ -139,7 +166,7 @@ def main():
             )
             os.makedirs(output_path, exist_ok=True)
 
-            process_video(video_file, output_path, model, align_model, metadata)
+            process_video(video_file, output_path, model, align_model, metadata, device)
 
         except Exception as e:
             logger.error(f"Error processing {video_file}: {e}")
