@@ -1,0 +1,85 @@
+# Default configuration for FlikModel training
+
+defaults:
+  - _self_
+
+# Model architecture
+model:
+  audio_model_name: "facebook/wav2vec2-base"
+  video_model_name: "MCG-NJU/videomae-base"
+  hidden_dim: 768
+  audio_feature_layer: 7
+  temporal_layers: 2
+  cross_attention_layers: 2
+  num_heads: 8
+  ff_dim: 3072
+  dropout: 0.1
+  freeze_audio: false
+  freeze_video: false
+  use_grounded_masked_prediction: false
+  mlm_mask_prob: 0.15
+  mlm_mask_length: 1
+  num_codebook_entries: 320
+
+# Dataset
+dataset:
+  manifest_path: "data/filtered_manifest_segments.json"  # preferred segment-level manifest
+  sample_rate: 16000
+  num_frames: 16
+  min_duration: 3.0
+  max_duration: 10.0
+  dummy: false  # set to true for testing
+
+# DataLoader
+dataloader:
+  batch_size: 8
+  shuffle: true
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+
+# Training
+training:
+  num_epochs: 50
+  gradient_accumulation_steps: 1
+  clip_grad_norm: 1.0
+  mixed_precision: true  # use AMP
+  checkpoint_dir: "checkpoints"
+  checkpoint_frequency: 1000  # steps
+  eval_frequency: 500  # steps
+  log_frequency: 10  # steps
+  run_retrieval_eval: true
+
+# Optimizer
+optimizer:
+  type: "adamw"
+  lr: 5.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# Scheduler
+scheduler:
+  type: "cosine"
+  total_steps: null  # auto‑computed from dataset size
+  eta_min: 1.0e-7
+
+# Loss
+loss:
+  contrastive_weight: 1.0
+  mlm_weight: 1.0
+  temperature: 0.07
+  mlm_label_smoothing: 0.0
+
+# Logging
+logging:
+  logger: "console"
+
+# Hardware
+hardware:
+  device: "cuda"
+
+# Validation (retrieval metrics)
+validation:
+  retrieval_top_k: [1, 5, 10]
+  eval_batch_size: 16
