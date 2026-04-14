@@ -195,6 +195,7 @@ def main():
         random_scores = []
 
     results = []
+    segment_results = []
 
     # 2. Process Loop
     logger.info(f"Processing {len(tasks)} videos...")
@@ -275,6 +276,27 @@ def main():
                     segment_scores_percentile.append(None)
                     segment_passed.append(True)  # No baseline, cannot filter
 
+                seg_z = segment_scores_z[-1]
+                seg_percentile = segment_scores_percentile[-1]
+                seg_ok = segment_passed[-1]
+                segment_results.append(
+                    {
+                        "id": f"{task['id']}_{seg['start']:.2f}_{seg['end']:.2f}",
+                        "video_id": task["id"],
+                        "video_path": task["video_path"],
+                        "json_path": task["json_path"],
+                        "start_sec": seg["start"],
+                        "end_sec": seg["end"],
+                        "text": seg.get("text", ""),
+                        "clip_score_raw": round(score_raw, 4),
+                        "clip_score_z": round(seg_z, 4) if seg_z is not None else None,
+                        "clip_score_percentile": round(seg_percentile, 2)
+                        if seg_percentile is not None
+                        else None,
+                        "segment_passed": bool(seg_ok),
+                    }
+                )
+
             avg_score_raw = np.mean(segment_scores_raw) if segment_scores_raw else 0.0
             avg_score_z = None
             avg_score_percentile = None
@@ -329,7 +351,12 @@ def main():
     with open(OUTPUT_FILE, "w") as f:
         json.dump(results, f, indent=2)
 
+    segment_output_file = OUTPUT_FILE.replace(".json", "_segments.json")
+    with open(segment_output_file, "w") as f:
+        json.dump(segment_results, f, indent=2)
+
     logger.info(f"\nDone. Results saved to {OUTPUT_FILE}")
+    logger.info(f"Segment-level results saved to {segment_output_file}")
 
 
 def check_randomized():

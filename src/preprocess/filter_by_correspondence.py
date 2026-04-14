@@ -44,6 +44,44 @@ def save_json(data, filepath):
         json.dump(data, f, indent=2)
 
 
+def build_segment_manifest(
+    scores_file, output_path, segment_percentile_threshold, logger
+):
+    """Build a segment-level manifest from alignment score output."""
+    segment_scores_path = scores_file.replace(".json", "_segments.json")
+    if not os.path.exists(segment_scores_path):
+        logger.warning(
+            f"Segment score file not found at {segment_scores_path}; skipping segment manifest"
+        )
+        return
+
+    segment_scores = load_json(segment_scores_path)
+    filtered_segments = []
+    for seg in segment_scores:
+        percentile = seg.get("clip_score_percentile")
+        if percentile is None:
+            continue
+        if percentile < segment_percentile_threshold:
+            continue
+        filtered_segments.append(
+            {
+                "id": seg["id"],
+                "video_id": seg.get("video_id"),
+                "video_path": seg["video_path"],
+                "json_path": seg.get("json_path", ""),
+                "start_sec": seg["start_sec"],
+                "end_sec": seg["end_sec"],
+                "text": seg.get("text", ""),
+                "clip_score_percentile": percentile,
+            }
+        )
+
+    segment_output = output_path.replace(".json", "_segments.json")
+    save_json(filtered_segments, segment_output)
+    logger.info(f"Segment manifest saved to {segment_output}")
+    logger.info(f"Segment manifest size: {len(filtered_segments)}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Filter videos by CLIP correspondence scores"
@@ -89,6 +127,11 @@ def main():
         type=float,
         default=SEGMENT_PERCENTILE_THRESHOLD,
         help=f"Minimum percentile for segment‑level pass (default: {SEGMENT_PERCENTILE_THRESHOLD})",
+    )
+    parser.add_argument(
+        "--build-segment-manifest",
+        action="store_true",
+        help="Also write a segment-level manifest based on segment percentile threshold",
     )
     args = parser.parse_args()
 
@@ -188,6 +231,14 @@ def main():
             and item.get("avg_clip_score_percentile") is not None
         ) / len(passed_ids)
         logger.info(f"Average percentile of kept videos: {avg_percentile:.1f}")
+
+    if args.build_segment_manifest:
+        build_segment_manifest(
+            scores_file=args.scores,
+            output_path=args.output,
+            segment_percentile_threshold=args.segment_percentile_threshold,
+            logger=logger,
+        )
 
 
 if __name__ == "__main__":
