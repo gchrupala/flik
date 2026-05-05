@@ -9,7 +9,7 @@ import torch
 import whisperx
 from tqdm import tqdm
 
-from CONSTANTS import (
+from src.CONSTANTS import (
     PROJECT_ROOT,
     VIDEO_ROOT as SOURCE_FOLDER,
     TRANSCRIPT_ROOT as OUTPUT_FOLDER,

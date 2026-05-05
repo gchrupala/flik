@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 from transformers import CLIPModel, CLIPProcessor
 
 # Config
-from CONSTANTS import (
+from src.CONSTANTS import (
     PROJECT_ROOT,
     OUTPUT_MANIFEST as MANIFEST_FILE,
     ALIGNMENT_SCORES_FILE as OUTPUT_FILE,

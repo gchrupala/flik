@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 
-from CONSTANTS import (
+from src.CONSTANTS import (
     PROJECT_ROOT,
     OUTPUT_MANIFEST,
     ALIGNMENT_SCORES_FILE,

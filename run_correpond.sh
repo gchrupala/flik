@@ -6,7 +6,7 @@
 #SBATCH --partition=GPU
 #SBATCH --gres=gpu:L40S:1
 
-cd /home/gshen/work_dir/flik
+cd "${SLURM_SUBMIT_DIR}"
 source .venv/bin/activate
 
 echo "Setting up environment variables for CUDA and PyTorch"
@@ -19,4 +19,4 @@ echo "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=$TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
 echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" 
 
 echo "Starting correspondence process"
-srun uv run src/check_correspondance.py
+srun uv run python -m src.preprocess.check_correspondance
