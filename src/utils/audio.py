@@ -1,8 +1,72 @@
 import torch
-import torchaudio
-import torchaudio.functional as F
 import numpy as np
-from typing import Tuple, Optional
+from typing import Optional
+
+
+def _load_audio_segment(
+    path: str,
+    start_sec: float,
+    end_sec: float,
+    target_sample_rate: int = 16000,
+) -> torch.Tensor:
+    """
+    Load audio segment using PyAV (ffmpeg bindings).
+    Works for both video and audio files (.mp4, .mkv, .avi, .mov, .webm,
+    .wav, .flac, .mp3, .ogg).
+    Returns waveform of shape (1, samples) at target_sample_rate.
+    """
+    import av
+
+    duration = end_sec - start_sec
+    num_samples = max(1, int(duration * target_sample_rate))
+
+    container = av.open(path)
+    try:
+        audio_stream = next(s for s in container.streams if s.type == "audio")
+    except StopIteration:
+        container.close()
+        raise RuntimeError(f"No audio stream found in {path}")
+
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16", layout="mono", rate=target_sample_rate
+    )
+
+    container.seek(int(start_sec * av.time_base))
+
+    samples_list = []
+    for frame in container.decode(audio_stream):
+        frame_pts_sec = float(frame.pts * audio_stream.time_base)
+        if frame_pts_sec > end_sec:
+            break
+        for resampled in resampler.resample(frame):
+            arr = resampled.to_ndarray().ravel()
+            samples_list.append(arr)
+
+    # Flush remaining samples from resampler
+    for resampled in resampler.resample(None):
+        arr = resampled.to_ndarray().ravel()
+        samples_list.append(arr)
+
+    container.close()
+
+    if samples_list:
+        all_samples = np.concatenate(samples_list)
+    else:
+        all_samples = np.zeros(0, dtype=np.int16)
+
+    # Trim/pad to exact length
+    if len(all_samples) > num_samples:
+        all_samples = all_samples[:num_samples]
+    elif len(all_samples) < num_samples:
+        all_samples = np.pad(all_samples, (0, num_samples - len(all_samples)))
+
+    waveform = torch.from_numpy(all_samples).float().unsqueeze(0)
+
+    # Normalize to zero mean, unit variance
+    if waveform.numel() > 0:
+        waveform = (waveform - waveform.mean()) / (waveform.std() + 1e-8)
+
+    return waveform
 
 
 def load_audio_from_video(
@@ -11,40 +75,7 @@ def load_audio_from_video(
     end_sec: float,
     target_sample_rate: int = 16000,
 ) -> torch.Tensor:
-    """
-    Load audio segment from video file.
-    Returns waveform of shape (1, samples) at target_sample_rate.
-    """
-    # Use torchaudio's avbackend
-    try:
-        # torchaudio.load can load video files and extract audio
-        waveform, sr = torchaudio.load(video_path)
-    except Exception as e:
-        raise RuntimeError(f"Failed to load audio from {video_path}: {e}")
-
-    # Ensure mono: (channels, samples) -> average if multiple channels
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-
-    # Resample if needed
-    if sr != target_sample_rate:
-        waveform = F.resample(waveform, sr, target_sample_rate)
-
-    # Extract segment
-    start_sample = int(start_sec * target_sample_rate)
-    end_sample = int(end_sec * target_sample_rate)
-    if end_sample > waveform.shape[1]:
-        # Pad with zeros if segment extends beyond file
-        pad_right = end_sample - waveform.shape[1]
-        waveform = torch.nn.functional.pad(waveform, (0, pad_right))
-
-    segment = waveform[:, start_sample:end_sample]
-
-    # Normalize to zero mean, unit variance (per segment)
-    if segment.numel() > 0:
-        segment = (segment - segment.mean()) / (segment.std() + 1e-8)
-
-    return segment
+    return _load_audio_segment(video_path, start_sec, end_sec, target_sample_rate)
 
 
 def load_audio_from_wav(
@@ -53,25 +84,7 @@ def load_audio_from_wav(
     end_sec: float,
     target_sample_rate: int = 16000,
 ) -> torch.Tensor:
-    """
-    Load audio segment from .wav file.
-    """
-    waveform, sr = torchaudio.load(wav_path)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sr != target_sample_rate:
-        waveform = F.resample(waveform, sr, target_sample_rate)
-
-    start_sample = int(start_sec * target_sample_rate)
-    end_sample = int(end_sec * target_sample_rate)
-    if end_sample > waveform.shape[1]:
-        pad_right = end_sample - waveform.shape[1]
-        waveform = torch.nn.functional.pad(waveform, (0, pad_right))
-
-    segment = waveform[:, start_sample:end_sample]
-    if segment.numel() > 0:
-        segment = (segment - segment.mean()) / (segment.std() + 1e-8)
-    return segment
+    return _load_audio_segment(wav_path, start_sec, end_sec, target_sample_rate)
 
 
 def audio_to_tensor(
@@ -81,13 +94,9 @@ def audio_to_tensor(
     sample_rate: int = 16000,
 ) -> torch.Tensor:
     """
-    Generic audio loading; detects video vs wav by extension.
+    Generic audio loading from video or audio files via PyAV.
     """
-    if audio_path.lower().endswith((".wav", ".flac", ".mp3", ".ogg")):
-        return load_audio_from_wav(audio_path, start_sec, end_sec, sample_rate)
-    else:
-        # Assume video file
-        return load_audio_from_video(audio_path, start_sec, end_sec, sample_rate)
+    return _load_audio_segment(audio_path, start_sec, end_sec, sample_rate)
 
 
 if __name__ == "__main__":
