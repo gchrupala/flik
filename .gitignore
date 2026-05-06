@@ -2,7 +2,9 @@ logdir/*
 data/*
 uv.lock
 AGENTS.md
-
+cache/*
+outputs/*
+slurm_job_scripts/*
 
 
 # Byte-compiled / optimized / DLL files
@@ -221,3 +223,4 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+out

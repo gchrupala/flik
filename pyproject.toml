@@ -19,6 +19,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "tensorboard>=2.20.0",
     "wandb>=0.26.1",
 ]
 
