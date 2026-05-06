@@ -73,7 +73,13 @@ loss:
 
 # Logging
 logging:
-  logger: "console"
+  use_wandb: false            # toggle to true to enable WandB
+  use_tensorboard: true
+  log_dir: "logdir"
+  wandb:
+    project: "flik-video-grounding"
+    entity: null              # your wandb username or team
+    offline: false            # true = no network needed
 
 # Hardware
 hardware:

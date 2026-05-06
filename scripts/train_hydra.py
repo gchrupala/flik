@@ -12,7 +12,6 @@ os.environ["TRANSFORMERS_CACHE"] = os.path.join(
 )
 os.environ["HF_HOME"] = os.path.join(os.path.dirname(__file__), "..", "cache")
 
-import logging
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -28,17 +27,22 @@ from src.models.flik_model import FlikModel
 from src.models.losses import CombinedLoss
 from src.datasets.video_audio_dataset import VideoAudioDataset
 from src.eval.retrieval import retrieval_recall_at_k
+from src.utils.logging import setup_logging as flik_setup_logging, log_metrics, close_loggers
 
 
-def setup_logging(cfg):
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
+def setup_logging(cfg, log_dir):
+    loggers = flik_setup_logging(
+        log_dir=log_dir,
+        name="flik",
+        tensorboard=cfg.logging.use_tensorboard,
+        wandb=cfg.logging.use_wandb,
+        wandb_project=cfg.logging.wandb.project,
+        wandb_entity=cfg.logging.wandb.entity,
+        wandb_offline=cfg.logging.wandb.offline,
+        config=OmegaConf.to_container(cfg, resolve=True),
     )
-    logger = logging.getLogger(__name__)
-    logger.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
-    return logger
+    loggers["logger"].info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
+    return loggers
 
 
 def train_one_epoch(
@@ -51,6 +55,9 @@ def train_one_epoch(
     device,
     logger,
     epoch,
+    global_step,
+    tb_writer=None,
+    wandb_run=None,
 ):
     model.train()
     total_loss = 0.0
@@ -108,12 +115,24 @@ def train_one_epoch(
         num_steps += 1
 
         # Log according to frequency
-        if step % cfg.training.log_frequency == 0:
-            logger.info(
-                f"Epoch {epoch} | Step {step} | Loss: {loss.item() * cfg.training.gradient_accumulation_steps:.4f} | "
-                f"Contrastive: {metrics.get('contrastive_loss', 0.0):.4f} | "
-                f"MLM: {metrics.get('mlm_loss', 0.0):.4f}"
+        if global_step % cfg.training.log_frequency == 0:
+            log_metrics(
+                global_step,
+                {
+                    "train/loss": loss.item() * cfg.training.gradient_accumulation_steps,
+                    "train/contrastive_loss": metrics.get("contrastive_loss", 0.0),
+                    "train/contrastive_acc": metrics.get("contrastive_acc", 0.0),
+                    "train/mlm_loss": metrics.get("mlm_loss", 0.0),
+                    "train/mlm_acc": metrics.get("mlm_acc", 0.0),
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "epoch": epoch,
+                },
+                tb_writer=tb_writer,
+                wandb_run=wandb_run,
+                logger=logger,
             )
+
+        global_step += 1
 
     # Compute epoch averages
     avg_loss = total_loss / num_steps if num_steps > 0 else 0.0
@@ -122,17 +141,25 @@ def train_one_epoch(
     avg_mlm_loss = total_mlm_loss / num_steps if num_steps > 0 else 0.0
     avg_mlm_acc = total_mlm_acc / num_steps if num_steps > 0 else 0.0
 
-    logger.info(
-        f"Epoch {epoch} summary: "
-        f"Loss = {avg_loss:.4f}, "
-        f"Contrastive = {avg_contrastive_loss:.4f} (acc {avg_contrastive_acc:.3f}), "
-        f"MLM = {avg_mlm_loss:.4f} (acc {avg_mlm_acc:.3f})"
+    log_metrics(
+        global_step,
+        {
+            "epoch/avg_loss": avg_loss,
+            "epoch/avg_contrastive_loss": avg_contrastive_loss,
+            "epoch/avg_contrastive_acc": avg_contrastive_acc,
+            "epoch/avg_mlm_loss": avg_mlm_loss,
+            "epoch/avg_mlm_acc": avg_mlm_acc,
+            "epoch": epoch,
+        },
+        tb_writer=tb_writer,
+        wandb_run=wandb_run,
+        logger=logger,
     )
-    return avg_loss
+    return global_step
 
 
 @torch.no_grad()
-def evaluate_retrieval(cfg, model, dataloader, device, logger):
+def evaluate_retrieval(cfg, model, dataloader, device, logger, tb_writer=None, wandb_run=None, step=0):
     model.eval()
     audio_embs = []
     video_embs = []
@@ -155,13 +182,27 @@ def evaluate_retrieval(cfg, model, dataloader, device, logger):
         video_embeddings,
         ks=cfg.validation.retrieval_top_k,
     )
-    logger.info(f"Retrieval metrics: {metrics}")
+    log_metrics(
+        step,
+        metrics,
+        tb_writer=tb_writer,
+        wandb_run=wandb_run,
+        logger=logger,
+        prefix="retrieval/",
+    )
     return metrics
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="default")
 def main(cfg: DictConfig):
-    logger = setup_logging(cfg)
+    # Resolve log_dir relative to original cwd (Hydra chdirs to its output dir)
+    from hydra.utils import get_original_cwd
+    log_dir = os.path.abspath(os.path.join(get_original_cwd(), cfg.logging.log_dir))
+
+    loggers = setup_logging(cfg, log_dir)
+    logger = loggers["logger"]
+    tb_writer = loggers["tb_writer"]
+    wandb_run = loggers["wandb_run"]
     logger.info("Starting training with Hydra configuration")
 
     # Device
@@ -253,9 +294,10 @@ def main(cfg: DictConfig):
         raise ValueError(f"Unknown scheduler type: {cfg.scheduler.type}")
 
     # Training loop
+    global_step = 0
     for epoch in range(1, cfg.training.num_epochs + 1):
         logger.info(f"--- Epoch {epoch}/{cfg.training.num_epochs} ---")
-        avg_loss = train_one_epoch(
+        global_step = train_one_epoch(
             cfg,
             model,
             dataloader,
@@ -265,10 +307,15 @@ def main(cfg: DictConfig):
             device,
             logger,
             epoch,
+            global_step,
+            tb_writer,
+            wandb_run,
         )
 
         if cfg.training.run_retrieval_eval:
-            evaluate_retrieval(cfg, model, dataloader, device, logger)
+            evaluate_retrieval(
+                cfg, model, dataloader, device, logger, tb_writer, wandb_run, global_step
+            )
 
     logger.info("Training finished")
     # Save checkpoint
@@ -279,15 +326,17 @@ def main(cfg: DictConfig):
     torch.save(
         {
             "epoch": cfg.training.num_epochs,
+            "global_step": global_step,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
-            "loss": avg_loss,
             "config": OmegaConf.to_container(cfg, resolve=True),
         },
         checkpoint_path,
     )
     logger.info(f"Checkpoint saved to {checkpoint_path}")
+
+    close_loggers(tb_writer=tb_writer, wandb_run=wandb_run)
 
 
 if __name__ == "__main__":

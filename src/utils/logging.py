@@ -13,6 +13,7 @@ def setup_logging(
     wandb: bool = False,
     wandb_project: Optional[str] = None,
     wandb_entity: Optional[str] = None,
+    wandb_offline: bool = False,
     config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
@@ -68,6 +69,7 @@ def setup_logging(
             entity=wandb_entity,
             config=config,
             dir=log_dir,
+            mode="offline" if wandb_offline else None,
         )
         logger.info(f"WandB run: {wandb_run.name}")
 

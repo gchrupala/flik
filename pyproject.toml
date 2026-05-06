@@ -17,6 +17,11 @@ dependencies = [
     "omegaconf>=2.3.0",
 ]
 
+[dependency-groups]
+dev = [
+    "wandb>=0.26.1",
+]
+
 
 # export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true
 # export LD_LIBRARY_PATH=$HOME/.pixi/envs/cuda/lib:$LD_LIBRARY_PATH
