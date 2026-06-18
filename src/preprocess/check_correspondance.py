@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import numpy as np
@@ -22,6 +23,8 @@ from src.CONSTANTS import (
     TARGET_FPS,
     CLIP_MODEL,
     CLIP_TOKEN_LIMIT,
+    CLIP_BATCH_SIZE,
+    CLIP_NUM_WORKERS,
     DEFAULT_FPS,
     MIN_STRIDE,
     SEGMENT_PERCENTILE_THRESHOLD,
@@ -34,6 +37,12 @@ DEVICE = (
     if torch.accelerator.is_available()
     else torch.device("cpu")
 )
+
+# Performance settings (overridable via CLI)
+_BATCH_SIZE = CLIP_BATCH_SIZE
+_NUM_WORKERS = CLIP_NUM_WORKERS
+_USE_FP16 = True
+_DECODER = "cpu"  # "cpu" or "nvdec"
 
 # Set up logging
 logging.basicConfig(
@@ -80,6 +89,122 @@ def load_video_frames(video_path, start_sec, end_sec, target_fps=TARGET_FPS):
 
     cap.release()
     return frames
+
+
+def load_video_frames_nvdec(video_path, start_sec, end_sec, target_fps=TARGET_FPS):
+    """NVDEC hardware video decode — stub for future implementation.
+
+    Future implementation should use one of:
+      - cv2.cudacodec (OpenCV CUDA module)
+      - PyNvVideoCodec (NVIDIA's Python bindings)
+      - NVIDIA DALI (Data Loading Library)
+      - ffmpeg with h264_cuvid via PyAV
+
+    The interface must match load_video_frames: return list[PIL.Image].
+    """
+    raise NotImplementedError(
+        "NVDEC hardware decode not yet implemented. Use --decoder cpu (default)."
+    )
+
+
+def _get_decoder_fn():
+    """Return the active decoder function based on _DECODER setting."""
+    if _DECODER == "nvdec":
+        return load_video_frames_nvdec
+    return load_video_frames
+
+
+def _score_pairs_batched(model, processor, texts, images, device, use_fp16):
+    """Score a batch of (text, image) pairs using CLIP.
+
+    Computes CLIP similarity for each pair via the diagonal of the similarity
+    matrix. This is mathematically equivalent to scoring each pair individually,
+    since CLIP encodes texts and images independently (no cross-attention).
+
+    Args:
+        texts: list of B caption strings.
+        images: list of B PIL Images.
+        device: torch device.
+        use_fp16: if True and on CUDA, use autocast for FP16 inference.
+
+    Returns:
+        list of B float scores (one per pair).
+    """
+    inputs = processor(
+        text=texts, images=images, return_tensors="pt", padding=True
+    ).to(device)
+    with torch.no_grad():
+        if use_fp16 and device.type == "cuda":
+            with torch.autocast("cuda", dtype=torch.float16):
+                out = model(**inputs)
+        else:
+            out = model(**inputs)
+    # Diagonal = per-pair similarity
+    return out.logits_per_image.diag().cpu().tolist()
+
+
+def _run_decode_score_pipeline(model, processor, decode_units, device, desc):
+    """Parallel decode + batched CLIP scoring pipeline.
+
+    Args:
+        decode_units: list of (global_idx, video_path, start, end, text).
+        device: torch device for CLIP inference.
+        desc: tqdm description string.
+
+    Returns:
+        dict: global_idx -> max frame score for that segment.
+    """
+    decoder_fn = _get_decoder_fn()
+    seg_frame_scores = {}  # global_idx -> list of per-frame scores
+
+    with ThreadPoolExecutor(max_workers=_NUM_WORKERS) as pool:
+        # Submit all decode tasks
+        futures = {}
+        for unit in decode_units:
+            gidx, vpath, start, end, text = unit
+            fut = pool.submit(decoder_fn, vpath, start, end, TARGET_FPS)
+            futures[fut] = unit
+
+        # Consume completed decodes, batch for CLIP
+        batch_texts, batch_images, batch_seg_ids = [], [], []
+
+        for fut in tqdm(
+            as_completed(futures), total=len(futures), desc=desc
+        ):
+            unit = futures[fut]
+            gidx, _, _, _, text = unit
+            try:
+                frames = fut.result()
+            except Exception as e:
+                logger.warning(f"Decode failed for seg {gidx}: {e}")
+                frames = []
+
+            if not frames:
+                continue
+
+            for frame in frames:
+                batch_texts.append(text)
+                batch_images.append(frame)
+                batch_seg_ids.append(gidx)
+
+                if len(batch_texts) >= _BATCH_SIZE:
+                    scores = _score_pairs_batched(
+                        model, processor, batch_texts, batch_images, device, _USE_FP16
+                    )
+                    for sid, sc in zip(batch_seg_ids, scores):
+                        seg_frame_scores.setdefault(sid, []).append(sc)
+                    batch_texts, batch_images, batch_seg_ids = [], [], []
+
+        # Score remaining
+        if batch_texts:
+            scores = _score_pairs_batched(
+                model, processor, batch_texts, batch_images, device, _USE_FP16
+            )
+            for sid, sc in zip(batch_seg_ids, scores):
+                seg_frame_scores.setdefault(sid, []).append(sc)
+
+    # Max per segment (best frame-text alignment)
+    return {sid: max(scores) for sid, scores in seg_frame_scores.items()}
 
 
 def establish_clip_score_baseline():
@@ -194,160 +319,149 @@ def main():
         )
         random_scores = []
 
-    results = []
-    segment_results = []
+    # 2. First pass: read transcripts, sample segments (no video decode)
+    logger.info(f"Sampling segments from {len(tasks)} videos...")
+    decode_units = []  # (global_idx, video_path, start, end, text)
+    task_segments = {}  # task_idx -> list of (global_idx, seg_dict)
 
-    # 2. Process Loop
-    logger.info(f"Processing {len(tasks)} videos...")
-
-    for task in tqdm(tasks):
+    for task_idx, task in enumerate(tqdm(tasks, desc="Reading transcripts")):
         try:
-            # Re-load transcript just to get segments
             with open(task["json_path"], "r") as f:
                 data = json.load(f)
             segments = data.get("segments", []) if isinstance(data, dict) else data
 
-            # Filter for segments > 2 seconds (better visual context)
             valid_segs = [s for s in segments if (s["end"] - s["start"]) > 2.0]
             if not valid_segs:
                 valid_segs = segments
 
-            # Random sample
             selected = random.sample(
                 valid_segs, min(SAMPLES_PER_VIDEO, len(valid_segs))
             )
 
-            segment_scores_raw = []
-            segment_scores_z = []
-            segment_scores_percentile = []
-            segment_passed = []
-
+            task_segs = []
             for seg in selected:
-                frames = load_video_frames(
-                    task["video_path"], seg["start"], seg["end"], TARGET_FPS
+                gidx = len(decode_units)
+                text = seg["text"][:CLIP_TOKEN_LIMIT]
+                decode_units.append(
+                    (gidx, task["video_path"], seg["start"], seg["end"], text)
                 )
+                task_segs.append((gidx, seg))
+            task_segments[task_idx] = task_segs
+        except Exception as e:
+            logger.warning(f"Failed to load transcript for {task['id']}: {e}")
+            task_segments[task_idx] = []
 
-                if not frames:
-                    continue
+    logger.info(f"Total segments to score: {len(decode_units)}")
+    logger.info(
+        f"Pipeline config: batch_size={_BATCH_SIZE}, num_workers={_NUM_WORKERS}, "
+        f"fp16={_USE_FP16}, decoder={_DECODER}"
+    )
 
-                text_input = seg["text"][:CLIP_TOKEN_LIMIT]  # CLIP limit
+    # 3. Parallel decode + batched CLIP scoring
+    seg_max_scores = _run_decode_score_pipeline(
+        model, processor, decode_units, DEVICE, "Decoding + scoring"
+    )
+    logger.info(f"Scored {len(seg_max_scores)} segments")
 
-                # # For debug only we show the frames in a 6x6 grid
-                # grid_size = (6, 6)
-                # if len(frames) > grid_size[0] * grid_size[1]:
-                #     frames = frames[: grid_size[0] * grid_size[1]]
-                # grid_img = Image.new(
-                #     "RGB",
-                #     (grid_size[1] * frames[0].width, grid_size[0] * frames[0].height),
-                # )
-                # for idx, frame in enumerate(frames):
-                #     row = idx // grid_size[1]
-                #     col = idx % grid_size[1]
-                #     grid_img.paste(
-                #         frame, (col * frame.width, row * frame.height)
-                #     )
-                # print(f"Segment Text: {text_input}")
-                # grid_img.show()
+    # 4. Build results (second pass)
+    results = []
+    segment_results = []
 
-                inputs = processor(
-                    text=[text_input], images=frames, return_tensors="pt", padding=True
-                ).to(DEVICE)
+    for task_idx, task in enumerate(tasks):
+        task_segs = task_segments.get(task_idx, [])
+        if not task_segs:
+            continue
 
-                with torch.no_grad():
-                    out = model(**inputs)
+        segment_scores_raw = []
+        segment_scores_z = []
+        segment_scores_percentile = []
+        segment_passed = []
 
-                # logits_per_image: [1, num_frames]
-                # We want the max alignment per segment (did the frame match the text at any point?)
-                score_raw = out.logits_per_image.max().item()
-                segment_scores_raw.append(score_raw)
+        for gidx, seg in task_segs:
+            score_raw = seg_max_scores.get(gidx, 0.0)
+            segment_scores_raw.append(score_raw)
 
-                # Compute normalized scores if random baseline available
-                if random_scores:
-                    z, perc = compute_normalized_scores(score_raw, random_scores)
-                    segment_scores_z.append(z)
-                    segment_scores_percentile.append(perc)
-                    # Determine if segment passes threshold
-                    if USE_SEGMENT_FILTER:
-                        segment_passed.append(perc >= SEGMENT_PERCENTILE_THRESHOLD)
-                    else:
-                        segment_passed.append(True)  # Not filtering, treat as passed
-                else:
-                    segment_scores_z.append(None)
-                    segment_scores_percentile.append(None)
-                    segment_passed.append(True)  # No baseline, cannot filter
-
-                seg_z = segment_scores_z[-1]
-                seg_percentile = segment_scores_percentile[-1]
-                seg_ok = segment_passed[-1]
-                segment_results.append(
-                    {
-                        "id": f"{task['id']}_{seg['start']:.2f}_{seg['end']:.2f}",
-                        "video_id": task["id"],
-                        "video_path": task["video_path"],
-                        "json_path": task["json_path"],
-                        "start_sec": seg["start"],
-                        "end_sec": seg["end"],
-                        "text": seg.get("text", ""),
-                        "clip_score_raw": round(score_raw, 4),
-                        "clip_score_z": round(seg_z, 4) if seg_z is not None else None,
-                        "clip_score_percentile": round(seg_percentile, 2)
-                        if seg_percentile is not None
-                        else None,
-                        "segment_passed": bool(seg_ok),
-                    }
-                )
-
-            avg_score_raw = np.mean(segment_scores_raw) if segment_scores_raw else 0.0
-            avg_score_z = None
-            avg_score_percentile = None
             if random_scores:
-                avg_score_z, avg_score_percentile = compute_normalized_scores(
-                    avg_score_raw, random_scores
-                )
+                z, perc = compute_normalized_scores(score_raw, random_scores)
+                segment_scores_z.append(z)
+                segment_scores_percentile.append(perc)
+                if USE_SEGMENT_FILTER:
+                    segment_passed.append(perc >= SEGMENT_PERCENTILE_THRESHOLD)
+                else:
+                    segment_passed.append(True)
+            else:
+                segment_scores_z.append(None)
+                segment_scores_percentile.append(None)
+                segment_passed.append(True)
 
-            # Video-level pass criteria
-            video_passed_by_percentile = False
-            video_passed_by_segment_fraction = False
-            if random_scores and avg_score_percentile is not None:
-                video_passed_by_percentile = (
-                    avg_score_percentile >= VIDEO_PERCENTILE_THRESHOLD
-                )
-            if segment_passed:
-                fraction_passed = sum(segment_passed) / len(segment_passed)
-                video_passed_by_segment_fraction = (
-                    fraction_passed >= 0.5
-                )  # at least half of segments pass
-
-            results.append(
+            seg_z = segment_scores_z[-1]
+            seg_percentile = segment_scores_percentile[-1]
+            seg_ok = segment_passed[-1]
+            segment_results.append(
                 {
-                    "id": task["id"],
+                    "id": f"{task['id']}_{seg['start']:.2f}_{seg['end']:.2f}",
+                    "video_id": task["id"],
                     "video_path": task["video_path"],
-                    "avg_clip_score": round(avg_score_raw, 4),  # backward compatibility
-                    "avg_clip_score_raw": round(avg_score_raw, 4),
-                    "avg_clip_score_z": round(avg_score_z, 4)
-                    if avg_score_z is not None
+                    "json_path": task["json_path"],
+                    "start_sec": seg["start"],
+                    "end_sec": seg["end"],
+                    "text": seg.get("text", ""),
+                    "clip_score_raw": round(score_raw, 4),
+                    "clip_score_z": round(seg_z, 4) if seg_z is not None else None,
+                    "clip_score_percentile": round(seg_percentile, 2)
+                    if seg_percentile is not None
                     else None,
-                    "avg_clip_score_percentile": round(avg_score_percentile, 2)
-                    if avg_score_percentile is not None
-                    else None,
-                    "segment_scores_raw": [round(s, 4) for s in segment_scores_raw],
-                    "segment_scores_z": [
-                        round(z, 4) if z is not None else None for z in segment_scores_z
-                    ],
-                    "segment_scores_percentile": [
-                        round(p, 2) if p is not None else None
-                        for p in segment_scores_percentile
-                    ],
-                    "segment_passed": segment_passed,
-                    "video_passed_by_percentile": video_passed_by_percentile,
-                    "video_passed_by_segment_fraction": video_passed_by_segment_fraction,
+                    "segment_passed": bool(seg_ok),
                 }
             )
 
-        except Exception as e:
-            logger.warning(f"\nFailed on {task['id']}: {e}")
+        avg_score_raw = np.mean(segment_scores_raw) if segment_scores_raw else 0.0
+        avg_score_z = None
+        avg_score_percentile = None
+        if random_scores:
+            avg_score_z, avg_score_percentile = compute_normalized_scores(
+                avg_score_raw, random_scores
+            )
 
-    # 3. Save Results
+        video_passed_by_percentile = False
+        video_passed_by_segment_fraction = False
+        if random_scores and avg_score_percentile is not None:
+            video_passed_by_percentile = (
+                avg_score_percentile >= VIDEO_PERCENTILE_THRESHOLD
+            )
+        if segment_passed:
+            fraction_passed = sum(segment_passed) / len(segment_passed)
+            video_passed_by_segment_fraction = (
+                fraction_passed >= 0.5
+            )
+
+        results.append(
+            {
+                "id": task["id"],
+                "video_path": task["video_path"],
+                "avg_clip_score": round(avg_score_raw, 4),
+                "avg_clip_score_raw": round(avg_score_raw, 4),
+                "avg_clip_score_z": round(avg_score_z, 4)
+                if avg_score_z is not None
+                else None,
+                "avg_clip_score_percentile": round(avg_score_percentile, 2)
+                if avg_score_percentile is not None
+                else None,
+                "segment_scores_raw": [round(s, 4) for s in segment_scores_raw],
+                "segment_scores_z": [
+                    round(z, 4) if z is not None else None for z in segment_scores_z
+                ],
+                "segment_scores_percentile": [
+                    round(p, 2) if p is not None else None
+                    for p in segment_scores_percentile
+                ],
+                "segment_passed": segment_passed,
+                "video_passed_by_percentile": video_passed_by_percentile,
+                "video_passed_by_segment_fraction": video_passed_by_segment_fraction,
+            }
+        )
+
+    # 5. Save Results
     with open(OUTPUT_FILE, "w") as f:
         json.dump(results, f, indent=2)
 
@@ -368,71 +482,52 @@ def check_randomized():
     model = CLIPModel.from_pretrained(CLIP_MODEL).to(DEVICE)
     processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
 
-    results = []
-
-    # 2. Process Loop
     logger.info(f"Processing {len(tasks)} videos...")
 
-    # Choose a random number of videos to process:
-
+    # 2. Sample segments and collect texts (no decode yet)
     random_tasks = random.sample(tasks, k=min(1000, len(tasks)))
-    all_text_input, all_frames = [], []
+    decode_units = []  # (idx, video_path, start, end, text)
 
-    # First we load all the data
-    for task in tqdm(random_tasks):
-        # Re-load transcript just to get segments
+    for task in tqdm(random_tasks, desc="Sampling segments"):
         with open(task["json_path"], "r") as f:
             data = json.load(f)
         segments = data.get("segments", []) if isinstance(data, dict) else data
 
-        # Filter for segments > 2 seconds (better visual context)
         valid_segs = [s for s in segments if (s["end"] - s["start"]) > 2.0]
         if not valid_segs:
             valid_segs = segments
 
-        # Random sample
         selected = random.sample(valid_segs, min(SAMPLES_PER_VIDEO, len(valid_segs)))
 
         for seg in selected:
-            frames = load_video_frames(
-                task["video_path"], seg["start"], seg["end"], TARGET_FPS
+            text = seg["text"][:CLIP_TOKEN_LIMIT]
+            decode_units.append(
+                (len(decode_units), task["video_path"], seg["start"], seg["end"], text)
             )
 
-            if not frames:
-                continue
+    # 3. Shuffle texts to create random text-frame pairings
+    texts = [u[4] for u in decode_units]
+    random.shuffle(texts)
+    decode_units = [
+        (u[0], u[1], u[2], u[3], texts[i]) for i, u in enumerate(decode_units)
+    ]
 
-            text_input = seg["text"][:CLIP_TOKEN_LIMIT]  # CLIP limit
+    logger.info(f"Total randomized pairs: {len(decode_units)}")
+    logger.info(
+        f"Pipeline config: batch_size={_BATCH_SIZE}, num_workers={_NUM_WORKERS}, "
+        f"fp16={_USE_FP16}, decoder={_DECODER}"
+    )
 
-            # Save the input to lists
-            all_text_input.append(text_input)
-            all_frames.append(frames)
+    # 4. Parallel decode + batched CLIP scoring (streaming, no RAM accumulation)
+    seg_max_scores = _run_decode_score_pipeline(
+        model, processor, decode_units, DEVICE, "Decoding + scoring (randomized)"
+    )
 
-    # Then we scramble the text inputs
-    random.shuffle(all_text_input)
-    idx = 0
-    for text_input, frames in tqdm(
-        zip(all_text_input, all_frames),
-        total=len(all_text_input),
-        desc="Processing randomized pairs",
-    ):
-        try:
-            inputs = processor(
-                text=[text_input], images=frames, return_tensors="pt", padding=True
-            ).to(DEVICE)
+    # 5. Save results (one score per decode unit, in original order)
+    results = [
+        seg_max_scores.get(i, 0.0) for i in range(len(decode_units))
+    ]
 
-            with torch.no_grad():
-                out = model(**inputs)
-
-            # logits_per_image: [1, num_frames]
-            # We want the max alignment per segment (did the frame match the text at any point?)
-            score = out.logits_per_image.max().item()
-
-            results.append(score)
-        except Exception as e:
-            logger.warning(f"\nFailed on randomized pair {idx}: {e}")
-        idx += 1
-
-    # 3. Save Results
     output_file = OUTPUT_FILE.replace(".json", "_randomized.json")
     with open(output_file, "w") as f:
         json.dump(results, f, indent=2)
@@ -632,7 +727,44 @@ if __name__ == "__main__":
         default="randomized",
         help="Which function to run: main (alignment), randomized (random pairs), output (stats), coco (baseline)",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=CLIP_BATCH_SIZE,
+        help=f"Number of (text, frame) pairs per CLIP forward pass (default: {CLIP_BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=CLIP_NUM_WORKERS,
+        help=f"CPU threads for parallel video decoding (default: {CLIP_NUM_WORKERS})",
+    )
+    parser.add_argument(
+        "--decoder",
+        type=str,
+        choices=["cpu", "nvdec"],
+        default="cpu",
+        help="Video decoder backend: cpu (cv2) or nvdec (stub, not yet implemented)",
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        default=True,
+        help="Use FP16 autocast on CUDA for faster inference (default: True)",
+    )
+    parser.add_argument(
+        "--no-fp16",
+        dest="fp16",
+        action="store_false",
+        help="Disable FP16, use FP32 (slower but bit-exact)",
+    )
     args = parser.parse_args()
+
+    # Apply performance settings
+    _BATCH_SIZE = args.batch_size
+    _NUM_WORKERS = args.num_workers
+    _USE_FP16 = args.fp16
+    _DECODER = args.decoder
 
     # Override DEVICE if specified
     if args.device is not None:

@@ -51,6 +51,10 @@ STAGES = [
         "extra_args": lambda cfg: (
             ["--mode", "randomized"]
             + (["--device", cfg.device] if cfg.device else [])
+            + (["--batch-size", str(cfg.batch_size)] if cfg.batch_size else [])
+            + (["--num-workers", str(cfg.num_workers)] if cfg.num_workers else [])
+            + (["--decoder", cfg.decoder] if cfg.decoder else [])
+            + (["--no-fp16"] if cfg.no_fp16 else [])
         ),
         "inputs": [OUTPUT_MANIFEST],
         "outputs": [ALIGNMENT_SCORES_FILE.replace(".json", "_randomized.json")],
@@ -63,6 +67,10 @@ STAGES = [
         "extra_args": lambda cfg: (
             ["--mode", "main"]
             + (["--device", cfg.device] if cfg.device else [])
+            + (["--batch-size", str(cfg.batch_size)] if cfg.batch_size else [])
+            + (["--num-workers", str(cfg.num_workers)] if cfg.num_workers else [])
+            + (["--decoder", cfg.decoder] if cfg.decoder else [])
+            + (["--no-fp16"] if cfg.no_fp16 else [])
         ),
         "inputs": [
             OUTPUT_MANIFEST,
@@ -207,6 +215,30 @@ def main():
         help="Device override for GPU stages (default: auto-detect via torch.accelerator)",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="CLIP batch size (text,frame) pairs per forward pass (default: from CONSTANTS)",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="CPU threads for parallel video decoding (default: from CONSTANTS)",
+    )
+    parser.add_argument(
+        "--decoder",
+        type=str,
+        default=None,
+        choices=["cpu", "nvdec"],
+        help="Video decoder backend (default: cpu)",
+    )
+    parser.add_argument(
+        "--no-fp16",
+        action="store_true",
+        help="Disable FP16 autocast on CUDA (use FP32)",
+    )
+    parser.add_argument(
         "--percentile-threshold",
         type=float,
         default=25.0,
@@ -246,6 +278,14 @@ def main():
     print(f"  Stages to run: {[s['name'] for s in selected]}")
     if args.device:
         print(f"  Device override: {args.device}")
+    if args.batch_size:
+        print(f"  Batch size: {args.batch_size}")
+    if args.num_workers:
+        print(f"  Num workers: {args.num_workers}")
+    if args.decoder:
+        print(f"  Decoder: {args.decoder}")
+    if args.no_fp16:
+        print(f"  FP16: disabled")
     if args.dry_run:
         print(f"  Mode: DRY-RUN (no execution)")
     print(f"  Filter thresholds: percentile={args.percentile_threshold}, "

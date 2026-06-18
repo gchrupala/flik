@@ -47,6 +47,10 @@ ENGLISH_LANGUAGE_PREFIX = "en-"
 # CLIP model constants
 CLIP_TOKEN_LIMIT = 77
 
+# CLIP scoring performance (parallel decode + batched GPU inference)
+CLIP_BATCH_SIZE = 256  # (text, frame) pairs per CLIP forward pass
+CLIP_NUM_WORKERS = 16  # CPU threads for parallel video decoding
+
 # Video processing constants
 DEFAULT_FPS = 24
 MIN_STRIDE = 1
