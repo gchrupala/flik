@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Diagnostic script — validates data loading and embedding diversity on cluster.
-Commit and run with: uv run python -m scripts.debug_data
+Commit and run with: uv run --extra cu128 python -m scripts.debug_data
 """
 import sys, os
 
