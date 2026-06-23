@@ -4,11 +4,17 @@ This guide covers training configuration, commands, monitoring, and the model ar
 
 ## Quick start
 
-### Single-GPU training
+### Single-GPU training (Snellius A100 slice)
+
+Snellius A100 slice: 1× A100 40GB GPU, 18 CPU cores, 120GB RAM.
+
+**Prerequisite**: Run the data pipeline first (see [DATASET_SETUP.md](DATASET_SETUP.md)). The default config expects `data/filtered_manifest_segments_validated.json` (produced by Stage 6 validation). If you only have `data/filtered_manifest_segments.json` (unvalidated), either run validation first or override the path: `dataset.manifest_path=data/filtered_manifest_segments.json`.
 
 ```bash
 uv run --extra cu128 python -m scripts.train_hydra
 ```
+
+The default config (`batch_size=64`, `num_workers=12`, AMP, gradient checkpointing) is tuned for this setup.
 
 ### CPU smoke test (dummy data)
 
@@ -62,9 +68,11 @@ All configuration is in `src/configs/default.yaml`. Key sections:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `batch_size` | 64 | Effective batch size for contrastive learning |
-| `num_workers` | 4 | DataLoader workers |
+| `num_workers` | 12 | DataLoader workers (Snellius A100 slice has 18 CPU cores) |
 | `pin_memory` | true | Pin memory for GPU transfer |
 | `drop_last` | true | Drop incomplete last batch |
+| `persistent_workers` | true | Keep workers alive across epochs |
+| `prefetch_factor` | 4 | Prefetch batches to keep GPU fed |
 
 ### Training (`training.*`)
 
@@ -151,6 +159,18 @@ Gradient checkpointing is enabled by default on CUDA (`gradient_checkpointing: t
 
 **Why**: At batch size 64 with 16-frame video clips, memory is the bottleneck. Gradient checkpointing lets you fit larger batches on a single A100 40GB.
 
+### Data loading performance
+
+Several optimizations keep the GPU fed:
+
+- **Video decoding** (`src/utils/video.py`): Sequential frame read in a single pass (no per-frame seeking), plus vectorized numpy resize/crop/normalize instead of per-frame PIL transforms. ~2.4× faster than the previous approach.
+- **Audio decoding** (`src/utils/audio.py`): Tolerant of corrupt AAC frames — skips bad frames and returns partial audio instead of failing. libav warning logs suppressed.
+- **DataLoader**: 12 workers with `persistent_workers=true` (workers stay alive across epochs) and `prefetch_factor=4` (prefetch batches to keep GPU fed).
+- **Dataset retry**: On load failure, retries with a different random segment (up to 3 attempts) before raising. Prevents single corrupt files from crashing training.
+- **cudnn benchmark**: Enabled on CUDA for consistent input sizes (video frames are always 224×224).
+
+Monitor `train/data_time_avg` — if it exceeds `train/forward_time_avg`, the GPU is data-starved and you should increase `num_workers` or `prefetch_factor`.
+
 ## Monitoring
 
 ### Logged metrics
@@ -167,6 +187,8 @@ Every `log_frequency` steps, the following metrics are logged to TensorBoard/Wan
 | `train/video_emb_std` | Std of video embeddings (collapse detection) |
 | `train/sim_diag_mean` | Mean of diagonal similarities (positive pairs) |
 | `train/sim_offdiag_mean` | Mean of off-diagonal similarities (negative pairs) |
+| `train/data_time_avg` | Avg data loading time per step (last 10 steps) — if high, GPU is starved |
+| `train/forward_time_avg` | Avg forward+backward time per step (last 10 steps) |
 
 ### Collapse detection
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Preprocessing orchestrator — runs the CLIP correspondence + filtering pipeline
-(stages 3-5) that produces data/filtered_manifest_segments.json for training.
+(stages 3-6) that produces data/filtered_manifest_segments_validated.json for training.
 
 Prerequisites (already run on the cluster):
     Stage 1: uv run --extra cu128 python -m src.preprocess.transcribe
@@ -11,9 +11,10 @@ This script orchestrates:
     Stage 3 (randomized): random CLIP baseline → null distribution for normalization
     Stage 4 (alignment):  main CLIP scoring on real video-text pairs → z-scores, percentiles
     Stage 5 (filter):     threshold filtering → filtered_manifest_segments.json
+    Stage 6 (validate):   load-test every segment → remove corrupt video/audio
 
 Usage:
-    uv run --extra cu128 python -m scripts.preprocess                     # run all 3 stages
+    uv run --extra cu128 python -m scripts.preprocess                     # run all 4 stages
     uv run --extra cu128 python -m scripts.preprocess --from-stage alignment   # resume at stage 4
     uv run --extra cu128 python -m scripts.preprocess --to-stage alignment     # stop after stage 4
     uv run --extra cu128 python -m scripts.preprocess --device cpu             # CPU override
@@ -99,6 +100,23 @@ STAGES = [
         "outputs": [
             os.path.join(DATA_DIR, "filtered_manifest.json"),
             os.path.join(DATA_DIR, "filtered_manifest_segments.json"),
+        ],
+        "gpu": False,
+    },
+    {
+        "name": "validate",
+        "title": "Stage 6: Validate segments (remove corrupt video/audio)",
+        "module": "scripts.validate_manifest",
+        "extra_args": lambda cfg: (
+            ["--input", os.path.join(DATA_DIR, "filtered_manifest_segments.json")]
+            + ["--output", os.path.join(DATA_DIR, "filtered_manifest_segments_validated.json")]
+            + (["--num-workers", str(cfg.num_workers)] if cfg.num_workers else [])
+        ),
+        "inputs": [
+            os.path.join(DATA_DIR, "filtered_manifest_segments.json"),
+        ],
+        "outputs": [
+            os.path.join(DATA_DIR, "filtered_manifest_segments_validated.json"),
         ],
         "gpu": False,
     },
@@ -316,7 +334,7 @@ def main():
     elif all_ok:
         print("#  ALL STAGES COMPLETE")
         if end_i == len(STAGES) - 1:
-            target = os.path.join(DATA_DIR, "filtered_manifest_segments.json")
+            target = os.path.join(DATA_DIR, "filtered_manifest_segments_validated.json")
             n = 0
             try:
                 import json
@@ -327,6 +345,18 @@ def main():
             print(f"#  Target file: {target}")
             print(f"#  Segments in manifest: {n}")
             print(f"#  Ready for training: uv run --extra cu128 python -m scripts.train_hydra")
+        elif end_i >= stage_index("filter"):
+            target = os.path.join(DATA_DIR, "filtered_manifest_segments.json")
+            n = 0
+            try:
+                import json
+                with open(target) as f:
+                    n = len(json.load(f))
+            except Exception:
+                pass
+            print(f"#  Target file: {target}")
+            print(f"#  Segments in manifest: {n}")
+            print(f"#  (Run --from-stage validate to produce validated manifest)")
     else:
         print("#  PIPELINE FAILED — see errors above")
     print("#" * 72)

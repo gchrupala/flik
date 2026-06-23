@@ -148,12 +148,19 @@ def train_one_epoch(
     use_amp = scaler is not None
     accum_steps = cfg.training.gradient_accumulation_steps
 
+    import time
+    data_times = []
+    forward_times = []
+
     for step, batch in enumerate(dataloader):
+        data_t = time.time()
         audio = batch["audio"].to(device)  # (B, 1, T)
         video = batch["video"].to(device)  # (B, F, C, H, W)
         audio_padding_mask = batch["audio_padding_mask"].to(device)  # (B, T_max)
+        data_times.append(time.time() - data_t)
 
         # Forward pass (with optional AMP)
+        fwd_t = time.time()
         with torch.amp.autocast("cuda", enabled=use_amp):
             out = model(
                 audio,
@@ -178,6 +185,8 @@ def train_one_epoch(
             scaler.scale(loss_scaled).backward()
         else:
             loss_scaled.backward()
+
+        forward_times.append(time.time() - fwd_t)
 
         # Update weights
         if (step + 1) % accum_steps == 0:
@@ -234,6 +243,8 @@ def train_one_epoch(
                     "train/video_emb_std": video_emb.std().item(),
                     "train/sim_diag_mean": diag_mean,
                     "train/sim_offdiag_mean": off_diag_mean,
+                    "train/data_time_avg": sum(data_times[-10:]) / max(1, len(data_times[-10:])),
+                    "train/forward_time_avg": sum(forward_times[-10:]) / max(1, len(forward_times[-10:])),
                     "epoch": epoch,
                 },
                 tb_writer=tb_writer,
@@ -324,6 +335,11 @@ def main(cfg: DictConfig):
         device = torch.device(cfg.hardware.device)
     logger.info(f"Using device: {device}")
 
+    # Enable cudnn benchmark for consistent input sizes (video frames are always 224x224)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        logger.info("cudnn benchmark enabled")
+
     # Dataset & DataLoader
     dataset = VideoAudioDataset(
         manifest_path=cfg.dataset.manifest_path,
@@ -333,8 +349,8 @@ def main(cfg: DictConfig):
         max_duration=cfg.dataset.max_duration,
         dummy=cfg.dataset.dummy,
     )
-    dataloader = DataLoader(
-        dataset,
+    # DataLoader: prefetch_factor only valid when num_workers > 0
+    dl_kwargs = dict(
         batch_size=cfg.dataloader.batch_size,
         shuffle=cfg.dataloader.shuffle,
         collate_fn=VideoAudioDataset.collate_fn,
@@ -342,6 +358,10 @@ def main(cfg: DictConfig):
         pin_memory=cfg.dataloader.pin_memory,
         drop_last=cfg.dataloader.drop_last,
     )
+    if cfg.dataloader.num_workers > 0:
+        dl_kwargs["persistent_workers"] = cfg.dataloader.get("persistent_workers", False)
+        dl_kwargs["prefetch_factor"] = cfg.dataloader.get("prefetch_factor", None)
+    dataloader = DataLoader(dataset, **dl_kwargs)
     logger.info(f"Dataset size: {len(dataset)}")
     logger.info(f"Batch size: {cfg.dataloader.batch_size}")
 

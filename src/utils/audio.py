@@ -14,8 +14,14 @@ def _load_audio_segment(
     Works for both video and audio files (.mp4, .mkv, .avi, .mov, .webm,
     .wav, .flac, .mp3, .ogg).
     Returns waveform of shape (1, samples) at target_sample_rate.
+
+    Tolerant of corrupt frames: if decoding fails partway through, returns
+    whatever samples were collected so far (padded to target length).
     """
     import av
+
+    # Suppress harmless libav warnings (e.g. "Referenced QT chapter track not found")
+    av.logging.set_level(av.logging.ERROR)
 
     duration = end_sec - start_sec
     num_samples = max(1, int(duration * target_sample_rate))
@@ -34,18 +40,30 @@ def _load_audio_segment(
     container.seek(int(start_sec * av.time_base))
 
     samples_list = []
-    for frame in container.decode(audio_stream):
-        frame_pts_sec = float(frame.pts * audio_stream.time_base)
-        if frame_pts_sec > end_sec:
-            break
-        for resampled in resampler.resample(frame):
-            arr = resampled.to_ndarray().ravel()
-            samples_list.append(arr)
+    try:
+        for frame in container.decode(audio_stream):
+            frame_pts_sec = float(frame.pts * audio_stream.time_base)
+            if frame_pts_sec > end_sec:
+                break
+            try:
+                for resampled in resampler.resample(frame):
+                    arr = resampled.to_ndarray().ravel()
+                    samples_list.append(arr)
+            except Exception:
+                # Skip corrupt frame, continue with next
+                continue
+    except Exception:
+        # Decode generator raised (e.g. "Input buffer exhausted").
+        # Use whatever samples we've collected so far.
+        pass
 
     # Flush remaining samples from resampler
-    for resampled in resampler.resample(None):
-        arr = resampled.to_ndarray().ravel()
-        samples_list.append(arr)
+    try:
+        for resampled in resampler.resample(None):
+            arr = resampled.to_ndarray().ravel()
+            samples_list.append(arr)
+    except Exception:
+        pass
 
     container.close()
 

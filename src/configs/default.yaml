@@ -23,7 +23,7 @@ model:
 
 # Dataset
 dataset:
-  manifest_path: "data/filtered_manifest_segments.json"  # preferred segment-level manifest
+  manifest_path: "data/filtered_manifest_segments_validated.json"  # validated segment-level manifest
   sample_rate: 16000
   num_frames: 16
   min_duration: 3.0
@@ -34,9 +34,11 @@ dataset:
 dataloader:
   batch_size: 64  # effective batch for contrastive learning (DCL makes this viable)
   shuffle: true
-  num_workers: 4
+  num_workers: 12  # parallel data loading (Snellius A100 slice has 18 CPU cores)
   pin_memory: true
   drop_last: true
+  persistent_workers: true  # keep workers alive across epochs (avoids restart overhead)
+  prefetch_factor: 4  # prefetch batches to keep GPU fed
 
 # Training
 training:
