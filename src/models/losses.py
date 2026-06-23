@@ -9,9 +9,10 @@ class ContrastiveLoss(nn.Module):
     InfoNCE (NT‑Xent) loss for paired audio‑video embeddings.
     """
 
-    def __init__(self, temperature: float = 0.07):
+    def __init__(self, temperature: float = 0.07, use_dcl: bool = True):
         super().__init__()
         self.temperature = temperature
+        self.use_dcl = use_dcl
         self.cross_entropy = nn.CrossEntropyLoss()
 
     def forward(
@@ -36,16 +37,24 @@ class ContrastiveLoss(nn.Module):
             torch.mm(audio_embeddings, video_embeddings.t()) / self.temperature
         )  # (batch, batch)
 
-        # Labels are the diagonal (positive pairs)
-        labels = torch.arange(batch_size, device=device)
-
-        # Symmetric loss
-        loss_a = self.cross_entropy(logits, labels)
-        loss_v = self.cross_entropy(logits.t(), labels)
-        loss = (loss_a + loss_v) / 2.0
+        if self.use_dcl:
+            # DCL: remove positive from denominator
+            # L_DCL = -s_ii/τ + logsumexp(s_{i,j≠i}/τ)
+            mask = torch.eye(batch_size, dtype=torch.bool, device=device)
+            neg_logits = logits.masked_fill(mask, float("-inf"))
+            loss_a = (-logits.diag() + torch.logsumexp(neg_logits, dim=-1)).mean()
+            loss_v = (-logits.diag() + torch.logsumexp(neg_logits.t(), dim=-1)).mean()
+            loss = (loss_a + loss_v) / 2.0
+        else:
+            # Standard InfoNCE
+            labels = torch.arange(batch_size, device=device)
+            loss_a = self.cross_entropy(logits, labels)
+            loss_v = self.cross_entropy(logits.t(), labels)
+            loss = (loss_a + loss_v) / 2.0
 
         # Compute accuracy
         with torch.no_grad():
+            labels = torch.arange(batch_size, device=device)
             preds = logits.argmax(dim=1)
             acc = (preds == labels).float().mean().item()
 
@@ -69,9 +78,6 @@ class MLMLoss(nn.Module):
         label_smoothing: float = 0.0,
     ):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_codebook_entries = num_codebook_entries
-        self.classifier = nn.Linear(hidden_dim, num_codebook_entries)
         self.loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     def forward(
@@ -128,11 +134,12 @@ class CombinedLoss(nn.Module):
         mlm_weight: float = 1.0,
         temperature: float = 0.07,
         mlm_label_smoothing: float = 0.0,
+        use_dcl: bool = True,
     ):
         super().__init__()
         self.contrastive_weight = contrastive_weight
         self.mlm_weight = mlm_weight
-        self.contrastive = ContrastiveLoss(temperature)
+        self.contrastive = ContrastiveLoss(temperature, use_dcl=use_dcl)
         self.mlm = MLMLoss(label_smoothing=mlm_label_smoothing)
 
     def forward(
@@ -178,10 +185,18 @@ if __name__ == "__main__":
     audio_emb = F.normalize(torch.randn(batch, hidden), p=2, dim=-1)
     video_emb = F.normalize(torch.randn(batch, hidden), p=2, dim=-1)
 
-    cont_loss, metrics = ContrastiveLoss()(audio_emb, video_emb)
+    # InfoNCE (use_dcl=False)
+    cont_loss_info, metrics_info = ContrastiveLoss(use_dcl=False)(audio_emb, video_emb)
     print(
-        f"Contrastive loss: {cont_loss.item():.4f}, acc: {metrics['contrastive_acc']:.3f}"
+        f"InfoNCE loss: {cont_loss_info.item():.4f}, acc: {metrics_info['contrastive_acc']:.3f}"
     )
+
+    # DCL (use_dcl=True, default)
+    cont_loss_dcl, metrics_dcl = ContrastiveLoss(use_dcl=True)(audio_emb, video_emb)
+    print(
+        f"DCL loss:     {cont_loss_dcl.item():.4f}, acc: {metrics_dcl['contrastive_acc']:.3f}"
+    )
+    print(f"  (values differ: {abs(cont_loss_info.item() - cont_loss_dcl.item()) > 1e-6})")
 
     # MLM test
     mlm_loss = MLMLoss()

@@ -48,18 +48,19 @@ class DualEncoder(nn.Module):
             pretrained=pretrained_video,
         )
 
-        # Projection heads (optional; we can keep identity)
+        # Projection heads (FaST-VGS recipe: 768→1536→768)
+        proj_hidden = hidden_dim * 2  # 1536 for hidden_dim=768
         self.audio_proj = nn.Sequential(
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, proj_hidden),   # 768 → 1536
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(proj_hidden, hidden_dim),   # 1536 → 768
         )
         self.video_proj = nn.Sequential(
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, proj_hidden),   # 768 → 1536
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(proj_hidden, hidden_dim),   # 1536 → 768
         )
 
     @staticmethod
@@ -123,6 +124,7 @@ class DualEncoder(nn.Module):
             out.update(
                 {
                     "audio_features": audio_features,
+                    "audio_feature_padding_mask": feature_padding_mask,
                     "video_frame_features": video_out.get("frame_embeddings"),
                 }
             )

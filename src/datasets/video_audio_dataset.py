@@ -129,52 +129,54 @@ class VideoAudioDataset(Dataset):
         seg = self.segments[idx]
 
         if self.dummy:
-            # Generate random tensors (no I/O)
-            # Audio: (1, T) where T = duration * sample_rate
+            # Generate random tensors (no I/O) — dummy mode is fine
             duration = seg["end_sec"] - seg["start_sec"]
             audio_len = int(duration * self.sample_rate)
             audio = torch.randn(1, audio_len)
-            # Video: (num_frames, 3, 224, 224)
             video = torch.randn(self.num_frames, 3, 224, 224)
-            # Text (not used for MLM; we'll use quantizer IDs)
-            text = seg["text"]
             return {
                 "audio": audio,
                 "video": video,
-                "text": text,
+                "text": seg["text"],
                 "segment_id": seg["id"],
                 "audio_len": audio_len,
             }
 
-        # Real loading
-        try:
-            video = video_to_tensor(
-                seg["video_path"],
-                seg["start_sec"],
-                seg["end_sec"],
-                num_frames=self.num_frames,
-            )
-            audio = audio_to_tensor(
-                seg["video_path"],  # same file contains audio
-                seg["start_sec"],
-                seg["end_sec"],
-                sample_rate=self.sample_rate,
-            )
-        except Exception as e:
-            # Fallback to dummy data if loading fails (for now)
-            print(f"Warning: Failed to load {seg['video_path']}: {e}")
-            duration = seg["end_sec"] - seg["start_sec"]
-            audio_len = int(duration * self.sample_rate)
-            audio = torch.randn(1, audio_len)
-            video = torch.randn(self.num_frames, 3, 224, 224)
+        # Real loading with retry on failure
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try_idx = idx if attempt == 0 else random.randint(0, len(self.segments) - 1)
+            seg = self.segments[try_idx]
+            try:
+                video = video_to_tensor(
+                    seg["video_path"],
+                    seg["start_sec"],
+                    seg["end_sec"],
+                    num_frames=self.num_frames,
+                )
+                audio = audio_to_tensor(
+                    seg["video_path"],
+                    seg["start_sec"],
+                    seg["end_sec"],
+                    sample_rate=self.sample_rate,
+                )
+                return {
+                    "audio": audio,
+                    "video": video,
+                    "text": seg["text"],
+                    "segment_id": seg["id"],
+                    "audio_len": audio.shape[1],
+                }
+            except Exception as e:
+                last_error = e
+                print(f"Warning: Failed to load segment {seg['id']} (attempt {attempt + 1}/{max_retries}): {e}")
+                continue
 
-        return {
-            "audio": audio,
-            "video": video,
-            "text": seg["text"],
-            "segment_id": seg["id"],
-            "audio_len": audio.shape[1],
-        }
+        # All retries failed — raise instead of returning noise
+        raise RuntimeError(
+            f"Failed to load any segment after {max_retries} attempts. Last error: {last_error}"
+        )
 
     @staticmethod
     def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:

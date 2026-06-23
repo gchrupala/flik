@@ -32,7 +32,7 @@ dataset:
 
 # DataLoader
 dataloader:
-  batch_size: 8
+  batch_size: 64  # effective batch for contrastive learning (DCL makes this viable)
   shuffle: true
   num_workers: 4
   pin_memory: true
@@ -43,7 +43,9 @@ training:
   num_epochs: 50
   gradient_accumulation_steps: 1
   clip_grad_norm: 1.0
-  mixed_precision: true  # use AMP
+  mixed_precision: true  # use AMP (now actually honored)
+  gradient_checkpointing: true  # trade compute for memory on large batches
+  freeze_encoder_epochs: 5  # freeze pretrained encoders for first N epochs (projection head warmup)
   checkpoint_dir: "checkpoints"
   checkpoint_frequency: 1000  # steps
   eval_frequency: 500  # steps
@@ -53,22 +55,25 @@ training:
 # Optimizer
 optimizer:
   type: "adamw"
-  lr: 5.0e-5
+  lr: 1.0e-3  # LR for new modules (projection heads, temporal transformer, cross-modal)
+  encoder_lr: 1.0e-5  # LR for pretrained encoders (wav2vec2, videomae) after warmup
   weight_decay: 0.01
   betas: [0.9, 0.999]
   eps: 1.0e-8
 
 # Scheduler
 scheduler:
-  type: "cosine"
+  type: "cosine_with_warmup"
   total_steps: null  # auto‑computed from dataset size
+  warmup_steps: 500  # linear warmup for LR
   eta_min: 1.0e-7
 
 # Loss
 loss:
   contrastive_weight: 1.0
-  mlm_weight: 1.0
+  mlm_weight: 0.0  # MLM disabled (no valid teacher); set >0 only with a real quantizer
   temperature: 0.07
+  use_dcl: true  # Decoupled Contrastive Learning — removes batch-size dependence
   mlm_label_smoothing: 0.0
 
 # Logging

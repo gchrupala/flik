@@ -105,37 +105,21 @@ class FlikModel(nn.Module):
                 - (optional) "audio_features": raw audio features.
                 - (optional) "video_frame_features": raw video frame features.
         """
-        # Step 1: Extract audio features and quantizer IDs via audio encoder
-        audio_out = self.dual_encoder.audio_encoder(
-            audio,
-            padding_mask=audio_padding_mask,
-        )
-        audio_features = audio_out["features"]  # (batch, seq_len_f, D)
-        audio_feature_padding_mask = audio_out["padding_mask"]  # (batch, seq_len_f)
-
-        # Step 2: Extract video frame features via video encoder
-        video_out = self.dual_encoder.video_encoder(video)
-        video_frame_features = video_out["frame_embeddings"]  # (batch, num_frames, D)
-        video_feature_padding_mask = None  # video frames are all valid
-
-        # Step 3: Dual encoder embeddings (pooled) for contrastive loss
-        dual_out = self.dual_encoder(
-            audio,
-            video,
-            audio_padding_mask=audio_padding_mask,
-            return_features=False,
-        )
-        audio_embedding = dual_out["audio_embedding"]
-        video_embedding = dual_out["video_embedding"]
-
-        # Prepare output dictionary
-        out = {
-            "audio_embedding": audio_embedding,
-            "video_embedding": video_embedding,
-        }
-
         if self.use_grounded_masked_prediction:
-            # Step 4: Mask audio features before cross-modal conditioning.
+            # Single forward: get both embeddings AND features for MLM
+            dual_out = self.dual_encoder(
+                audio,
+                video,
+                audio_padding_mask=audio_padding_mask,
+                return_features=True,
+            )
+            audio_embedding = dual_out["audio_embedding"]
+            video_embedding = dual_out["video_embedding"]
+            audio_features = dual_out["audio_features"]
+            video_frame_features = dual_out["video_frame_features"]
+            audio_feature_padding_mask = dual_out.get("audio_feature_padding_mask")
+
+            # MLM mask creation
             if mlm_mask is None:
                 mlm_mask = self._create_mlm_mask(
                     audio_features.shape[:2],
@@ -148,36 +132,54 @@ class FlikModel(nn.Module):
             masked_audio_features = audio_features.clone()
             masked_audio_features[mlm_mask] = 0.0
 
-            # Step 5: Cross‑attention (audio queries, video key‑value)
             cross_out = self.cross_modal(
                 masked_audio_features,
                 video_frame_features,
                 audio_padding_mask=audio_feature_padding_mask,
-                video_padding_mask=video_feature_padding_mask,
+                video_padding_mask=None,
             )
             audio_contextualized = cross_out["audio_contextualized"]
 
-            # Step 6: Predict teacher-derived target bins at masked positions.
-            mlm_logits = self.compute_mlm_logits(audio_contextualized)
+            mlm_logits = self.mlm_head(audio_contextualized)
             with torch.no_grad():
                 teacher_logits = self.target_projection(audio_features.detach())
                 mlm_targets = teacher_logits.argmax(dim=-1)
 
-            out.update(
-                {
-                    "mlm_logits": mlm_logits,
-                    "mlm_targets": mlm_targets,
-                    "mlm_mask": mlm_mask,
-                }
+            out = {
+                "audio_embedding": audio_embedding,
+                "video_embedding": video_embedding,
+                "mlm_logits": mlm_logits,
+                "mlm_targets": mlm_targets,
+                "mlm_mask": mlm_mask,
+            }
+        else:
+            # Contrastive-only: single forward, no features needed
+            dual_out = self.dual_encoder(
+                audio,
+                video,
+                audio_padding_mask=audio_padding_mask,
+                return_features=False,
             )
+            out = {
+                "audio_embedding": dual_out["audio_embedding"],
+                "video_embedding": dual_out["video_embedding"],
+            }
 
         if return_features:
-            out.update(
-                {
-                    "audio_features": audio_features,
-                    "video_frame_features": video_frame_features,
-                }
-            )
+            # For features when MLM is off, we'd need a separate call.
+            # This is only used by debug scripts, so we handle it simply.
+            if not self.use_grounded_masked_prediction:
+                dual_out = self.dual_encoder(
+                    audio,
+                    video,
+                    audio_padding_mask=audio_padding_mask,
+                    return_features=True,
+                )
+                out["audio_features"] = dual_out["audio_features"]
+                out["video_frame_features"] = dual_out["video_frame_features"]
+            else:
+                out["audio_features"] = audio_features
+                out["video_frame_features"] = video_frame_features
 
         return out
 
@@ -190,12 +192,6 @@ class FlikModel(nn.Module):
     def encode_video(self, video: torch.Tensor) -> torch.Tensor:
         """Encode video to normalized embedding (for retrieval)."""
         return self.dual_encoder.encode_video(video)
-
-    def compute_mlm_logits(self, audio_contextualized: torch.Tensor) -> torch.Tensor:
-        """Compute logits for quantizer ID prediction."""
-        return self.mlm_head(
-            audio_contextualized
-        )  # (batch, seq_len, num_codebook_entries)
 
     @staticmethod
     def _create_mlm_mask(

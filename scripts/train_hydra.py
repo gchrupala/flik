@@ -1,10 +1,20 @@
 #!/usr/bin/env python
 """
 Training script for FlikModel with Hydra configuration management.
+
+Key features:
+- DCL (Decoupled Contrastive Learning) loss for small-batch viability
+- Mixed precision (AMP) with GradScaler
+- Gradient checkpointing for memory efficiency
+- Encoder warmup (freeze pretrained encoders for first N epochs)
+- Separate LRs for pretrained encoders vs new modules
+- Cosine schedule with linear warmup
+- Embedding statistics logging (collapse detection)
 """
 
 import sys
 import os
+import math
 
 # Set HuggingFace cache to a local directory to avoid permission issues
 os.environ["TRANSFORMERS_CACHE"] = os.path.join(
@@ -16,7 +26,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
@@ -29,6 +39,69 @@ from src.datasets.video_audio_dataset import VideoAudioDataset
 from src.eval.retrieval import retrieval_recall_at_k
 from src.utils.logging import setup_logging as flik_setup_logging, log_metrics, close_loggers
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _is_encoder_param(name: str) -> bool:
+    """Check if a parameter belongs to a pretrained encoder (wav2vec2 or videomae)."""
+    return "wav2vec2" in name or "videomae" in name
+
+
+def freeze_encoders(model: nn.Module):
+    """Freeze pretrained encoder parameters."""
+    for name, param in model.named_parameters():
+        if _is_encoder_param(name):
+            param.requires_grad = False
+
+
+def unfreeze_encoders(model: nn.Module):
+    """Unfreeze pretrained encoder parameters."""
+    for name, param in model.named_parameters():
+        if _is_encoder_param(name):
+            param.requires_grad = True
+
+
+def build_param_groups(model: nn.Module, lr: float, encoder_lr: float, weight_decay: float):
+    """Create two parameter groups: new modules (lr) and pretrained encoders (encoder_lr)."""
+    encoder_params = []
+    encoder_param_names = []
+    new_params = []
+    new_param_names = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if _is_encoder_param(name):
+            encoder_params.append(param)
+            encoder_param_names.append(name)
+        else:
+            new_params.append(param)
+            new_param_names.append(name)
+
+    param_groups = [
+        {"params": new_params, "lr": lr, "weight_decay": weight_decay, "name": "new"},
+    ]
+    if encoder_params:
+        param_groups.append(
+            {"params": encoder_params, "lr": encoder_lr, "weight_decay": weight_decay, "name": "encoder"}
+        )
+
+    return param_groups, len(new_params), len(encoder_params)
+
+
+def cosine_with_warmup_lambda(step: int, warmup_steps: int, total_steps: int) -> float:
+    """LR multiplier: linear warmup → cosine decay."""
+    if warmup_steps > 0 and step < warmup_steps:
+        return float(step) / max(1.0, float(warmup_steps))
+    progress = float(step - warmup_steps) / max(1.0, float(total_steps - warmup_steps))
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 def setup_logging(cfg, log_dir):
     loggers = flik_setup_logging(
@@ -45,6 +118,10 @@ def setup_logging(cfg, log_dir):
     return loggers
 
 
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
 def train_one_epoch(
     cfg,
     model,
@@ -56,6 +133,7 @@ def train_one_epoch(
     logger,
     epoch,
     global_step,
+    scaler=None,
     tb_writer=None,
     wandb_run=None,
 ):
@@ -67,47 +145,61 @@ def train_one_epoch(
     total_mlm_acc = 0.0
     num_steps = 0
 
+    use_amp = scaler is not None
+    accum_steps = cfg.training.gradient_accumulation_steps
+
     for step, batch in enumerate(dataloader):
-        # Move batch to device
         audio = batch["audio"].to(device)  # (B, 1, T)
         video = batch["video"].to(device)  # (B, F, C, H, W)
         audio_padding_mask = batch["audio_padding_mask"].to(device)  # (B, T_max)
-        audio_lengths = batch["audio_lengths"].to(device)  # (B,)
 
-        # Forward pass
-        out = model(
-            audio,
-            video,
-            audio_padding_mask=audio_padding_mask,
-            mlm_mask=None,  # let model create random mask
-            return_features=False,
-        )
-
-        # Compute loss
-        loss, metrics = loss_fn(
-            audio_embeddings=out["audio_embedding"],
-            video_embeddings=out["video_embedding"],
-            mlm_logits=out.get("mlm_logits"),
-            mlm_targets=out.get("mlm_targets"),
-            mlm_mask=out.get("mlm_mask"),
-        )
+        # Forward pass (with optional AMP)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            out = model(
+                audio,
+                video,
+                audio_padding_mask=audio_padding_mask,
+                mlm_mask=None,
+                return_features=False,
+            )
+            loss, metrics = loss_fn(
+                audio_embeddings=out["audio_embedding"],
+                video_embeddings=out["video_embedding"],
+                mlm_logits=out.get("mlm_logits"),
+                mlm_targets=out.get("mlm_targets"),
+                mlm_mask=out.get("mlm_mask"),
+            )
 
         # Scale loss for gradient accumulation
-        loss = loss / cfg.training.gradient_accumulation_steps
-        loss.backward()
+        loss_scaled = loss / accum_steps
+
+        # Backward pass (with optional GradScaler)
+        if use_amp:
+            scaler.scale(loss_scaled).backward()
+        else:
+            loss_scaled.backward()
 
         # Update weights
-        if (step + 1) % cfg.training.gradient_accumulation_steps == 0:
+        if (step + 1) % accum_steps == 0:
+            if use_amp:
+                scaler.unscale_(optimizer)
+
             if cfg.training.clip_grad_norm > 0:
                 nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.training.clip_grad_norm
                 )
-            optimizer.step()
+
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+
             scheduler.step()
             optimizer.zero_grad()
 
         # Accumulate metrics
-        total_loss += loss.item() * cfg.training.gradient_accumulation_steps
+        total_loss += loss.item()
         total_contrastive_loss += metrics.get("contrastive_loss", 0.0)
         total_contrastive_acc += metrics.get("contrastive_acc", 0.0)
         total_mlm_loss += metrics.get("mlm_loss", 0.0)
@@ -116,15 +208,32 @@ def train_one_epoch(
 
         # Log according to frequency
         if global_step % cfg.training.log_frequency == 0:
+            # Embedding statistics for collapse detection
+            with torch.no_grad():
+                audio_emb = out["audio_embedding"]
+                video_emb = out["video_embedding"]
+                sim_matrix = audio_emb @ video_emb.t()
+                batch_size = audio_emb.shape[0]
+                diag_mean = sim_matrix.diag().mean().item()
+                if batch_size > 1:
+                    off_diag_sum = sim_matrix.sum() - sim_matrix.diag().sum()
+                    off_diag_mean = (off_diag_sum / (batch_size * (batch_size - 1))).item()
+                else:
+                    off_diag_mean = 0.0
+
             log_metrics(
                 global_step,
                 {
-                    "train/loss": loss.item() * cfg.training.gradient_accumulation_steps,
+                    "train/loss": loss.item(),
                     "train/contrastive_loss": metrics.get("contrastive_loss", 0.0),
                     "train/contrastive_acc": metrics.get("contrastive_acc", 0.0),
                     "train/mlm_loss": metrics.get("mlm_loss", 0.0),
                     "train/mlm_acc": metrics.get("mlm_acc", 0.0),
                     "train/lr": scheduler.get_last_lr()[0],
+                    "train/audio_emb_std": audio_emb.std().item(),
+                    "train/video_emb_std": video_emb.std().item(),
+                    "train/sim_diag_mean": diag_mean,
+                    "train/sim_offdiag_mean": off_diag_mean,
                     "epoch": epoch,
                 },
                 tb_writer=tb_writer,
@@ -193,9 +302,12 @@ def evaluate_retrieval(cfg, model, dataloader, device, logger, tb_writer=None, w
     return metrics
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="default")
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+@hydra.main(version_base=None, config_path="../src/configs", config_name="default")
 def main(cfg: DictConfig):
-    # Resolve log_dir relative to original cwd (Hydra chdirs to its output dir)
     from hydra.utils import get_original_cwd
     log_dir = os.path.abspath(os.path.join(get_original_cwd(), cfg.logging.log_dir))
 
@@ -231,6 +343,7 @@ def main(cfg: DictConfig):
         drop_last=cfg.dataloader.drop_last,
     )
     logger.info(f"Dataset size: {len(dataset)}")
+    logger.info(f"Batch size: {cfg.dataloader.batch_size}")
 
     # Model
     model = FlikModel(
@@ -250,23 +363,57 @@ def main(cfg: DictConfig):
         mlm_mask_length=cfg.model.mlm_mask_length,
         num_codebook_entries=cfg.model.num_codebook_entries,
     ).to(device)
-    logger.info(
-        f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters"
-    )
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Model initialized: {total_params:,} total params, {trainable_params:,} trainable")
+
+    # Gradient checkpointing (saves memory at the cost of recomputation)
+    if cfg.training.get("gradient_checkpointing", False) and device.type == "cuda":
+        try:
+            model.dual_encoder.audio_encoder.wav2vec2.gradient_checkpointing_enable()
+            model.dual_encoder.video_encoder.videomae.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled on wav2vec2 + videomae")
+        except Exception as e:
+            logger.warning(f"Failed to enable gradient checkpointing: {e}")
+
+    # Encoder warmup: freeze pretrained encoders for first N epochs
+    freeze_encoder_epochs = cfg.training.get("freeze_encoder_epochs", 0)
+    if freeze_encoder_epochs > 0:
+        freeze_encoders(model)
+        logger.info(
+            f"Pretrained encoders FROZEN for first {freeze_encoder_epochs} epochs "
+            f"(projection heads + temporal transformer will train)"
+        )
 
     # Loss function
     loss_fn = CombinedLoss(
         contrastive_weight=cfg.loss.contrastive_weight,
         mlm_weight=cfg.loss.mlm_weight,
         temperature=cfg.loss.temperature,
+        use_dcl=cfg.loss.get("use_dcl", True),
         mlm_label_smoothing=cfg.loss.mlm_label_smoothing,
     ).to(device)
+    logger.info(
+        f"Loss: contrastive_weight={cfg.loss.contrastive_weight}, "
+        f"mlm_weight={cfg.loss.mlm_weight}, "
+        f"use_dcl={cfg.loss.get('use_dcl', True)}, "
+        f"temperature={cfg.loss.temperature}"
+    )
 
-    # Optimizer
+    # Optimizer with separate param groups
+    encoder_lr = cfg.optimizer.get("encoder_lr", cfg.optimizer.lr)
+    param_groups, n_new, n_enc = build_param_groups(
+        model, cfg.optimizer.lr, encoder_lr, cfg.optimizer.weight_decay
+    )
+    logger.info(
+        f"Param groups: {n_new} new-module params (lr={cfg.optimizer.lr}), "
+        f"{n_enc} encoder params (lr={encoder_lr})"
+    )
+
     if cfg.optimizer.type == "adamw":
         optimizer = AdamW(
-            model.parameters(),
-            lr=cfg.optimizer.lr,
+            param_groups,
             weight_decay=cfg.optimizer.weight_decay,
             betas=tuple(cfg.optimizer.betas),
             eps=cfg.optimizer.eps,
@@ -274,28 +421,77 @@ def main(cfg: DictConfig):
     else:
         raise ValueError(f"Unknown optimizer type: {cfg.optimizer.type}")
 
-    # Scheduler
+    # Scheduler: cosine with linear warmup
     if cfg.scheduler.total_steps is None:
         total_steps = (
-            len(dataloader)
-            * cfg.training.num_epochs
+            len(dataloader) * cfg.training.num_epochs
             // cfg.training.gradient_accumulation_steps
         )
     else:
         total_steps = cfg.scheduler.total_steps
 
-    if cfg.scheduler.type == "cosine":
-        scheduler = CosineAnnealingLR(
+    warmup_steps = cfg.scheduler.get("warmup_steps", 0)
+
+    if cfg.scheduler.type == "cosine_with_warmup":
+        scheduler = LambdaLR(
             optimizer,
-            T_max=total_steps,
-            eta_min=cfg.scheduler.eta_min,
+            lr_lambda=lambda step: cosine_with_warmup_lambda(step, warmup_steps, total_steps),
+        )
+    elif cfg.scheduler.type == "cosine":
+        scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: cosine_with_warmup_lambda(step, 0, total_steps),
         )
     else:
         raise ValueError(f"Unknown scheduler type: {cfg.scheduler.type}")
 
+    logger.info(
+        f"Scheduler: {cfg.scheduler.type}, total_steps={total_steps}, "
+        f"warmup_steps={warmup_steps}"
+    )
+
+    # Mixed precision (AMP)
+    use_amp = (
+        cfg.training.get("mixed_precision", False)
+        and device.type == "cuda"
+    )
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    if use_amp:
+        logger.info("Mixed precision (AMP) enabled")
+    else:
+        logger.info("Mixed precision disabled (CPU or config flag off)")
+
     # Training loop
     global_step = 0
     for epoch in range(1, cfg.training.num_epochs + 1):
+        # Unfreeze encoders after warmup
+        if freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs + 1:
+            unfreeze_encoders(model)
+            # Rebuild optimizer to include encoder params
+            param_groups, n_new, n_enc = build_param_groups(
+                model, cfg.optimizer.lr, encoder_lr, cfg.optimizer.weight_decay
+            )
+            optimizer = AdamW(
+                param_groups,
+                weight_decay=cfg.optimizer.weight_decay,
+                betas=tuple(cfg.optimizer.betas),
+                eps=cfg.optimizer.eps,
+            )
+            # Rebuild scheduler to continue from current step
+            remaining_steps = total_steps - global_step
+            scheduler = LambdaLR(
+                optimizer,
+                lr_lambda=lambda step: cosine_with_warmup_lambda(
+                    step + global_step, warmup_steps, total_steps
+                ),
+            )
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info(
+                f"Encoders UNFROZEN at epoch {epoch}. "
+                f"Trainable params: {trainable_params:,}. "
+                f"Optimizer rebuilt with encoder_lr={encoder_lr}"
+            )
+
         logger.info(f"--- Epoch {epoch}/{cfg.training.num_epochs} ---")
         global_step = train_one_epoch(
             cfg,
@@ -308,8 +504,9 @@ def main(cfg: DictConfig):
             logger,
             epoch,
             global_step,
-            tb_writer,
-            wandb_run,
+            scaler=scaler,
+            tb_writer=tb_writer,
+            wandb_run=wandb_run,
         )
 
         if cfg.training.run_retrieval_eval:
@@ -318,6 +515,7 @@ def main(cfg: DictConfig):
             )
 
     logger.info("Training finished")
+
     # Save checkpoint
     checkpoint_path = os.path.join(
         cfg.training.checkpoint_dir, f"checkpoint_epoch{cfg.training.num_epochs}.pth"
