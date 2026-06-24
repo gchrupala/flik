@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 import cv2
 import numpy as np
@@ -64,30 +64,31 @@ def load_video_frames(video_path, start_sec, end_sec, target_fps=TARGET_FPS):
     if not cap.isOpened():
         return []
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = DEFAULT_FPS
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = DEFAULT_FPS
 
-    start_frame = int(start_sec * fps)
-    end_frame = int(end_sec * fps)
-    stride = max(MIN_STRIDE, int(round(fps / target_fps)))
+        start_frame = int(start_sec * fps)
+        end_frame = int(end_sec * fps)
+        stride = max(MIN_STRIDE, int(round(fps / target_fps)))
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    current_pos = start_frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        current_pos = start_frame
 
-    while current_pos < end_frame:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        while current_pos < end_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        # Capture frame if it matches stride
-        if (current_pos - start_frame) % stride == 0:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(Image.fromarray(frame))
+            # Capture frame if it matches stride
+            if (current_pos - start_frame) % stride == 0:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(frame))
 
-        current_pos += 1
-
-    cap.release()
+            current_pos += 1
+    finally:
+        cap.release()
     return frames
 
 
@@ -146,6 +147,12 @@ def _score_pairs_batched(model, processor, texts, images, device, use_fp16):
 def _run_decode_score_pipeline(model, processor, decode_units, device, desc):
     """Parallel decode + batched CLIP scoring pipeline.
 
+    Uses a bounded sliding window of outstanding decode futures to prevent
+    CPU RAM exhaustion. Without bounding, all segments are submitted at once
+    and their decoded PIL frames accumulate in completed-but-unconsumed
+    futures, which can exceed system RAM on large manifests (7309 segments
+    × ~15 frames × ~1-3 MB/frame = 100+ GB).
+
     Args:
         decode_units: list of (global_idx, video_path, start, end, text).
         device: torch device for CLIP inference.
@@ -157,51 +164,83 @@ def _run_decode_score_pipeline(model, processor, decode_units, device, desc):
     decoder_fn = _get_decoder_fn()
     seg_frame_scores = {}  # global_idx -> list of per-frame scores
 
+    # Bounded outstanding futures to limit RAM (decoded frames in-flight).
+    # At most MAX_PENDING segments' frames exist in memory simultaneously.
+    MAX_PENDING = _NUM_WORKERS * 4
+
+    batch_texts, batch_images, batch_seg_ids = [], [], []
+
     with ThreadPoolExecutor(max_workers=_NUM_WORKERS) as pool:
-        # Submit all decode tasks
-        futures = {}
-        for unit in decode_units:
+        futures = {}  # fut -> unit (only pending futures, popped on completion)
+        unit_iter = iter(decode_units)
+        exhausted = False
+
+        # Submit initial batch
+        for _ in range(MAX_PENDING):
+            try:
+                unit = next(unit_iter)
+            except StopIteration:
+                exhausted = True
+                break
             gidx, vpath, start, end, text = unit
             fut = pool.submit(decoder_fn, vpath, start, end, TARGET_FPS)
             futures[fut] = unit
 
-        # Consume completed decodes, batch for CLIP
-        batch_texts, batch_images, batch_seg_ids = [], [], []
+        pbar = tqdm(total=len(decode_units), desc=desc)
 
-        for fut in tqdm(
-            as_completed(futures), total=len(futures), desc=desc
-        ):
-            unit = futures[fut]
-            gidx, _, _, _, text = unit
-            try:
-                frames = fut.result()
-            except Exception as e:
-                logger.warning(f"Decode failed for seg {gidx}: {e}")
-                frames = []
+        while futures:
+            # Wait for at least one future to complete
+            done, _ = wait(set(futures), return_when=FIRST_COMPLETED)
 
-            if not frames:
-                continue
+            for fut in done:
+                # Pop to allow GC of decoded frames (future caches its result)
+                unit = futures.pop(fut)
+                gidx, _, _, _, text = unit
+                pbar.update(1)
 
-            for frame in frames:
-                batch_texts.append(text)
-                batch_images.append(frame)
-                batch_seg_ids.append(gidx)
+                try:
+                    frames = fut.result()
+                except Exception as e:
+                    logger.warning(f"Decode failed for seg {gidx}: {e}")
+                    frames = []
 
-                if len(batch_texts) >= _BATCH_SIZE:
-                    scores = _score_pairs_batched(
-                        model, processor, batch_texts, batch_images, device, _USE_FP16
-                    )
-                    for sid, sc in zip(batch_seg_ids, scores):
-                        seg_frame_scores.setdefault(sid, []).append(sc)
-                    batch_texts, batch_images, batch_seg_ids = [], [], []
+                if frames:
+                    for frame in frames:
+                        batch_texts.append(text)
+                        batch_images.append(frame)
+                        batch_seg_ids.append(gidx)
 
-        # Score remaining
-        if batch_texts:
-            scores = _score_pairs_batched(
-                model, processor, batch_texts, batch_images, device, _USE_FP16
-            )
-            for sid, sc in zip(batch_seg_ids, scores):
-                seg_frame_scores.setdefault(sid, []).append(sc)
+                        if len(batch_texts) >= _BATCH_SIZE:
+                            scores = _score_pairs_batched(
+                                model, processor, batch_texts,
+                                batch_images, device, _USE_FP16,
+                            )
+                            for sid, sc in zip(batch_seg_ids, scores):
+                                seg_frame_scores.setdefault(sid, []).append(sc)
+                            batch_texts, batch_images, batch_seg_ids = [], [], []
+
+                # Submit replacement unit to keep the pipeline full
+                if not exhausted:
+                    try:
+                        unit = next(unit_iter)
+                    except StopIteration:
+                        exhausted = True
+                    else:
+                        gidx, vpath, start, end, text = unit
+                        fut = pool.submit(
+                            decoder_fn, vpath, start, end, TARGET_FPS
+                        )
+                        futures[fut] = unit
+
+        pbar.close()
+
+    # Score remaining batch
+    if batch_texts:
+        scores = _score_pairs_batched(
+            model, processor, batch_texts, batch_images, device, _USE_FP16
+        )
+        for sid, sc in zip(batch_seg_ids, scores):
+            seg_frame_scores.setdefault(sid, []).append(sc)
 
     # Max per segment (best frame-text alignment)
     return {sid: max(scores) for sid, scores in seg_frame_scores.items()}
