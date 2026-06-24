@@ -207,7 +207,7 @@ def run_stage(stage: dict, cfg) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Orchestrate CLIP correspondence scoring + filtering (stages 3-5)",
+        description="Orchestrate CLIP correspondence scoring + filtering + validation (stages 3-6)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Prerequisites: stages 1 (transcribe) and 2 (filter_transcripts) must already be run.",
     )
@@ -290,7 +290,7 @@ def main():
     # --- Header ---
     print()
     print("#" * 72)
-    print("#  FLIK PREPROCESSING ORCHESTRATOR (stages 3-5)")
+    print("#  FLIK PREPROCESSING ORCHESTRATOR (stages 3-6)")
     print("#" * 72)
     print(f"  Project root: {CONSTANTS_ROOT}")
     print(f"  Stages to run: {[s['name'] for s in selected]}")

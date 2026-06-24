@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -21,8 +22,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from src.CONSTANTS import PROJECT_ROOT
 from src.utils.video import video_to_tensor
 from src.utils.audio import audio_to_tensor
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(
+            os.path.join(PROJECT_ROOT, "logdir/validate_manifest.log")
+        ),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 
 def validate_segment(seg: dict, num_frames: int = 16, sample_rate: int = 16000) -> tuple:
@@ -98,21 +113,22 @@ def main():
 
     # Load manifest
     if not os.path.exists(args.input):
-        print(f"Error: Input manifest not found: {args.input}")
+        logger.error(f"Input manifest not found: {args.input}")
         sys.exit(1)
 
     with open(args.input, "r", encoding="utf-8") as f:
         segments = json.load(f)
 
-    print(f"Validating {len(segments)} segments from {args.input}")
-    print(f"  Workers: {args.num_workers}")
-    print(f"  Output: {args.output}")
-    print()
+    logger.info(f"Validating {len(segments)} segments from {args.input}")
+    logger.info(f"  Workers: {args.num_workers}")
+    logger.info(f"  Output: {args.output}")
 
     # Validate in parallel
     valid_segments = []
     failed = []
     t0 = time.time()
+
+    from tqdm.auto import tqdm
 
     with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
         futures = {
@@ -122,7 +138,9 @@ def main():
             for seg in segments
         }
 
-        for i, future in enumerate(as_completed(futures)):
+        for future in tqdm(
+            as_completed(futures), total=len(futures), desc="Validating segments"
+        ):
             seg = futures[future]
             seg_id, success, error = future.result()
 
@@ -131,16 +149,6 @@ def main():
             else:
                 failed.append((seg_id, error))
 
-            # Progress every 100 segments
-            if (i + 1) % 100 == 0 or (i + 1) == len(segments):
-                elapsed = time.time() - t0
-                rate = (i + 1) / elapsed
-                print(
-                    f"  [{i+1}/{len(segments)}] "
-                    f"valid={len(valid_segments)} failed={len(failed)} "
-                    f"({rate:.1f} seg/s, {elapsed:.0f}s elapsed)"
-                )
-
     elapsed = time.time() - t0
 
     # Save validated manifest
@@ -148,28 +156,27 @@ def main():
         json.dump(valid_segments, f, indent=2, ensure_ascii=False)
 
     # Summary
-    print()
-    print("=" * 60)
-    print(f"VALIDATION COMPLETE ({elapsed:.0f}s)")
-    print(f"  Total segments:   {len(segments)}")
-    print(f"  Valid:            {len(valid_segments)} ({100*len(valid_segments)/len(segments):.1f}%)")
-    print(f"  Failed:           {len(failed)} ({100*len(failed)/len(segments):.1f}%)")
-    print(f"  Output:           {args.output}")
-    print()
+    logger.info("=" * 60)
+    logger.info(f"VALIDATION COMPLETE ({elapsed:.1f}s)")
+    logger.info(f"  Total segments:   {len(segments)}")
+    logger.info(f"  Valid:            {len(valid_segments)} ({100*len(valid_segments)/len(segments):.1f}%)")
+    logger.info(f"  Failed:           {len(failed)} ({100*len(failed)/len(segments):.1f}%)")
+    logger.info(f"  Throughput:       {len(segments)/elapsed:.1f} seg/s")
+    logger.info(f"  Output:           {args.output}")
 
     if failed:
-        print("Failed segments (first 20):")
+        logger.info(f"Failed segments (first 20):")
         for seg_id, error in failed[:20]:
-            print(f"  {seg_id}: {error[:80]}")
+            logger.info(f"  {seg_id}: {error[:80]}")
         if len(failed) > 20:
-            print(f"  ... and {len(failed) - 20} more")
+            logger.info(f"  ... and {len(failed) - 20} more")
 
         # Save failure log
         fail_log = args.output.replace(".json", "_failures.txt")
         with open(fail_log, "w") as f:
             for seg_id, error in failed:
                 f.write(f"{seg_id}\t{error}\n")
-        print(f"\n  Failure log: {fail_log}")
+        logger.info(f"  Failure log: {fail_log}")
 
 
 if __name__ == "__main__":
