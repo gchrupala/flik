@@ -92,10 +92,12 @@ def build_param_groups(model: nn.Module, lr: float, encoder_lr: float, weight_de
 
 
 def cosine_with_warmup_lambda(step: int, warmup_steps: int, total_steps: int) -> float:
-    """LR multiplier: linear warmup → cosine decay."""
+    """LR multiplier: linear warmup → cosine decay → clamp at eta_min."""
     if warmup_steps > 0 and step < warmup_steps:
         return float(step) / max(1.0, float(warmup_steps))
     progress = float(step - warmup_steps) / max(1.0, float(total_steps - warmup_steps))
+    # Clamp to prevent cosine from cycling back up after total_steps
+    progress = min(1.0, progress)
     return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
@@ -497,12 +499,16 @@ def main(cfg: DictConfig):
                 betas=tuple(cfg.optimizer.betas),
                 eps=cfg.optimizer.eps,
             )
-            # Rebuild scheduler to continue from current step
-            remaining_steps = total_steps - global_step
+            # Rebuild scheduler to continue from current step.
+            # CRITICAL: capture global_step by VALUE (default arg), not by reference.
+            # Python closures capture variables, not values — if global_step is
+            # reassigned in main() each epoch, the lambda would see the updated
+            # value, causing the effective step to grow at ~2x the correct rate.
+            step_offset = global_step
             scheduler = LambdaLR(
                 optimizer,
-                lr_lambda=lambda step: cosine_with_warmup_lambda(
-                    step + global_step, warmup_steps, total_steps
+                lr_lambda=lambda step, offset=step_offset: cosine_with_warmup_lambda(
+                    step + offset, warmup_steps, total_steps
                 ),
             )
             trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
