@@ -2,12 +2,38 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from typing import Optional, Tuple
+
+
+def _gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
+    """All-gather a tensor across DDP ranks, preserving the autograd graph.
+
+    Uses ``torch.distributed.nn.all_gather`` (autograd-aware). The local
+    tensor MUST be ``.contiguous()`` — non-contiguous gradients break the
+    internal ``_ReduceScatter`` backward (PyTorch #120386). Returns the
+    concatenated tensor of shape ``(world_size * batch, D)``.
+
+    When DDP is not initialized, returns the input unchanged (single-GPU
+    fast path).
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return tensor
+    gathered = torch.distributed.nn.all_gather(tensor.contiguous())
+    return torch.cat(gathered, dim=0)
 
 
 class ContrastiveLoss(nn.Module):
     """
-    InfoNCE (NT‑Xent) loss for paired audio‑video embeddings.
+    InfoNCE (NT‑Xent) / DCL loss for paired audio‑video embeddings.
+
+    Under DDP, embeddings are all-gathered across ranks (autograd-preserving)
+    so every rank sees the full set of negatives. The loss is computed with
+    *local* semantics: each rank only computes the loss rows for its own
+    ``B_local`` audio samples against the full ``N = world_size * B_local``
+    video embeddings (and symmetrically for video→audio). This avoids the
+    ``O(N²)`` full-logits memory and the gradient-amplification bug that
+    arises when every rank computes the full global loss (OpenCLIP #1144).
     """
 
     def __init__(self, temperature: float = 0.07, use_dcl: bool = True):
@@ -23,41 +49,56 @@ class ContrastiveLoss(nn.Module):
     ) -> Tuple[torch.Tensor, dict]:
         """
         Args:
-            audio_embeddings: (batch, D) L2‑normalized.
-            video_embeddings: (batch, D) L2‑normalized.
+            audio_embeddings: (B_local, D) L2‑normalized, this rank's shard.
+            video_embeddings: (B_local, D) L2‑normalized, this rank's shard.
 
         Returns:
-            loss: scalar.
+            loss: scalar (local-loss contribution; DDP averages across ranks).
             metrics: dict with accuracy etc.
         """
-        batch_size = audio_embeddings.shape[0]
+        local_batch = audio_embeddings.shape[0]
         device = audio_embeddings.device
 
-        # Cosine similarity matrix
-        logits = (
-            torch.mm(audio_embeddings, video_embeddings.t()) / self.temperature
-        )  # (batch, batch)
+        # All-gather across DDP ranks (no-op on single GPU). Gradients flow
+        # back to each rank's own embeddings only.
+        all_audio = _gather_with_grad(audio_embeddings)  # (N, D)
+        all_video = _gather_with_grad(video_embeddings)   # (N, D)
+        global_batch = all_audio.shape[0]
+
+        # Rank offset: this rank's samples occupy rows [rank*B_local, (rank+1)*B_local)
+        rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+        offset = rank * local_batch
+
+        # Local logits: this rank's B_local audio vs ALL N video embeddings.
+        # Shape (B_local, N). Labels are the global indices of this rank's pairs.
+        logits_a = audio_embeddings @ all_video.t() / self.temperature
+        logits_v = video_embeddings @ all_audio.t() / self.temperature
+        labels = torch.arange(offset, offset + local_batch, device=device)
 
         if self.use_dcl:
-            # DCL: remove positive from denominator
-            # L_DCL = -s_ii/τ + logsumexp(s_{i,j≠i}/τ)
-            mask = torch.eye(batch_size, dtype=torch.bool, device=device)
-            neg_logits = logits.masked_fill(mask, float("-inf"))
-            loss_a = (-logits.diag() + torch.logsumexp(neg_logits, dim=-1)).mean()
-            loss_v = (-logits.diag() + torch.logsumexp(neg_logits.t(), dim=-1)).mean()
+            # DCL: remove the positive from the denominator.
+            # The positive for row i (local index) is column labels[i] (global).
+            mask = torch.zeros_like(logits_a, dtype=torch.bool)
+            mask[torch.arange(local_batch, device=device), labels] = True
+            neg_logits_a = logits_a.masked_fill(mask, float("-inf"))
+            neg_logits_v = logits_v.masked_fill(mask, float("-inf"))
+            loss_a = (-logits_a.gather(1, labels.unsqueeze(1)).squeeze(1)
+                      + torch.logsumexp(neg_logits_a, dim=-1)).mean()
+            loss_v = (-logits_v.gather(1, labels.unsqueeze(1)).squeeze(1)
+                      + torch.logsumexp(neg_logits_v, dim=-1)).mean()
             loss = (loss_a + loss_v) / 2.0
         else:
-            # Standard InfoNCE
-            labels = torch.arange(batch_size, device=device)
-            loss_a = self.cross_entropy(logits, labels)
-            loss_v = self.cross_entropy(logits.t(), labels)
+            # Standard InfoNCE with global labels.
+            loss_a = self.cross_entropy(logits_a, labels)
+            loss_v = self.cross_entropy(logits_v, labels)
             loss = (loss_a + loss_v) / 2.0
 
-        # Compute accuracy
+        # Compute accuracy (local rows only, against global candidates)
         with torch.no_grad():
-            labels = torch.arange(batch_size, device=device)
-            preds = logits.argmax(dim=1)
-            acc = (preds == labels).float().mean().item()
+            preds_a = logits_a.argmax(dim=1)
+            preds_v = logits_v.argmax(dim=1)
+            acc = ((preds_a == labels).float().mean().item()
+                   + (preds_v == labels).float().mean().item()) / 2.0
 
         metrics = {
             "contrastive_loss": loss.item(),
@@ -87,8 +128,11 @@ class VarianceLoss(nn.Module):
     def forward(self, *embeddings: torch.Tensor) -> torch.Tensor:
         loss = embeddings[0].new_tensor(0.0)
         for z in embeddings:
+            # Gather across DDP ranks so std is measured over the global batch
+            # (a per-rank std could miss cross-rank collapse). No-op on single GPU.
+            z_global = _gather_with_grad(z)
             # std per dimension across the batch (biased estimator + eps)
-            std = torch.sqrt(z.var(dim=0, unbiased=False) + self.eps)
+            std = torch.sqrt(z_global.var(dim=0, unbiased=False) + self.eps)
             loss = loss + torch.mean(torch.relu(self.gamma - std))
         return loss / len(embeddings)
 

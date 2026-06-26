@@ -28,7 +28,10 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 import hydra
@@ -51,6 +54,25 @@ from src.utils.logging import setup_logging as flik_setup_logging, log_metrics, 
 def _is_encoder_param(name: str) -> bool:
     """Check if a parameter belongs to a pretrained encoder (wav2vec2 or videomae)."""
     return "wav2vec2" in name or "videomae" in name
+
+
+def _setup_distributed():
+    """Initialize the DDP process group from torchrun env vars.
+
+    Returns (rank, world_size, local_rank, is_ddp). No-op (returns 0,1,0,False)
+    when not launched under torchrun / when CUDA is unavailable.
+    """
+    if not (dist.is_available() and torch.cuda.is_available()):
+        return 0, 1, 0, False
+    # torchrun sets LOCAL_RANK / RANK / WORLD_SIZE; honor them.
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size <= 1 and not os.environ.get("RANK"):
+        return 0, 1, 0, False
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(local_rank)
+    return rank, world_size, local_rank, True
 
 
 def freeze_encoders(model: nn.Module):
@@ -333,14 +355,21 @@ def main(cfg: DictConfig):
     from hydra.utils import get_original_cwd
     log_dir = os.path.abspath(os.path.join(get_original_cwd(), cfg.logging.log_dir))
 
-    loggers = setup_logging(cfg, log_dir)
+    # DDP init (no-op on single GPU / CPU). Must happen before any CUDA context.
+    rank, world_size, local_rank, is_ddp = _setup_distributed()
+
+    loggers = setup_logging(cfg, log_dir, rank=rank)
     logger = loggers["logger"]
     tb_writer = loggers["tb_writer"]
     wandb_run = loggers["wandb_run"]
     logger.info("Starting training with Hydra configuration")
+    if is_ddp:
+        logger.info(f"DDP initialized: rank={rank}, world_size={world_size}, local_rank={local_rank}")
 
     # Device
-    if cfg.hardware.device == "auto":
+    if is_ddp:
+        device = torch.device(f"cuda:{local_rank}")
+    elif cfg.hardware.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(cfg.hardware.device)
@@ -360,21 +389,34 @@ def main(cfg: DictConfig):
         max_duration=cfg.dataset.max_duration,
         dummy=cfg.dataset.dummy,
     )
+    # Under DDP, use a DistributedSampler (disjoint shards per rank). The
+    # sampler handles shuffling; DataLoader.shuffle must be False when a
+    # sampler is provided. set_epoch() is called in the training loop.
+    if is_ddp:
+        train_sampler = DistributedSampler(
+            dataset, shuffle=True, drop_last=cfg.dataloader.drop_last
+        )
+        shuffle = False
+    else:
+        train_sampler = None
+        shuffle = cfg.dataloader.shuffle
     # DataLoader: prefetch_factor only valid when num_workers > 0
     dl_kwargs = dict(
         batch_size=cfg.dataloader.batch_size,
-        shuffle=cfg.dataloader.shuffle,
+        shuffle=shuffle,
         collate_fn=VideoAudioDataset.collate_fn,
         num_workers=cfg.dataloader.num_workers,
         pin_memory=cfg.dataloader.pin_memory,
         drop_last=cfg.dataloader.drop_last,
     )
+    if train_sampler is not None:
+        dl_kwargs["sampler"] = train_sampler
     if cfg.dataloader.num_workers > 0:
         dl_kwargs["persistent_workers"] = cfg.dataloader.get("persistent_workers", False)
         dl_kwargs["prefetch_factor"] = cfg.dataloader.get("prefetch_factor", None)
     dataloader = DataLoader(dataset, **dl_kwargs)
     logger.info(f"Dataset size: {len(dataset)}")
-    logger.info(f"Batch size: {cfg.dataloader.batch_size}")
+    logger.info(f"Batch size: {cfg.dataloader.batch_size}" + (f" (per-rank; global={cfg.dataloader.batch_size * world_size})" if is_ddp else ""))
 
     # Model
     model = FlikModel(
@@ -399,12 +441,21 @@ def main(cfg: DictConfig):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Model initialized: {total_params:,} total params, {trainable_params:,} trainable")
 
-    # Gradient checkpointing (saves memory at the cost of recomputation)
+    # Gradient checkpointing (saves memory at the cost of recomputation).
+    # CRITICAL under DDP: use_reentrant=False is required for DDP's autograd
+    # graph analysis to work with find_unused_parameters=True. Also call
+    # enable_input_require_grads() so the checkpointed submodules' inputs
+    # require grad (otherwise DDP silently skips their gradients).
     if cfg.training.get("gradient_checkpointing", False) and device.type == "cuda":
         try:
-            model.dual_encoder.audio_encoder.wav2vec2.gradient_checkpointing_enable()
-            model.dual_encoder.video_encoder.videomae.gradient_checkpointing_enable()
-            logger.info("Gradient checkpointing enabled on wav2vec2 + videomae")
+            model.dual_encoder.audio_encoder.wav2vec2.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            model.dual_encoder.video_encoder.videomae.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            model.enable_input_require_grads()
+            logger.info("Gradient checkpointing enabled on wav2vec2 + videomae (use_reentrant=False)")
         except Exception as e:
             logger.warning(f"Failed to enable gradient checkpointing: {e}")
 
@@ -416,6 +467,21 @@ def main(cfg: DictConfig):
             f"Pretrained encoders FROZEN for first {freeze_encoder_epochs} epochs "
             f"(projection heads + temporal transformer will train)"
         )
+
+    # Wrap with DDP after moving to device, enabling gradient checkpointing,
+    # and freezing encoders. find_unused_parameters=True is required because
+    # the MLM head is skipped when mlm_weight=0 and the encoders are frozen
+    # pre-unfreeze — those params receive no gradient. gradient_as_bucket_view
+    # reuses gradient bucket memory (small perf win). Do NOT use static_graph
+    # (incompatible with mid-training encoder unfreeze).
+    if is_ddp:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+        )
+        logger.info(f"Model wrapped with DDP (find_unused_parameters=True)")
 
     # Loss function
     loss_fn = CombinedLoss(
@@ -499,6 +565,9 @@ def main(cfg: DictConfig):
     # Training loop
     global_step = 0
     for epoch in range(1, cfg.training.num_epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         # Unfreeze encoders after warmup
         if freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs + 1:
             unfreeze_encoders(model)
@@ -549,32 +618,43 @@ def main(cfg: DictConfig):
             wandb_run=wandb_run,
         )
 
-        if cfg.training.run_retrieval_eval:
+        if cfg.training.run_retrieval_eval and (not is_ddp or rank == 0):
             evaluate_retrieval(
                 cfg, model, dataloader, device, logger, tb_writer, wandb_run, global_step
             )
 
     logger.info("Training finished")
 
-    # Save checkpoint
-    checkpoint_path = os.path.join(
-        cfg.training.checkpoint_dir, f"checkpoint_epoch{cfg.training.num_epochs}.pth"
-    )
-    os.makedirs(cfg.training.checkpoint_dir, exist_ok=True)
-    torch.save(
-        {
-            "epoch": cfg.training.num_epochs,
-            "global_step": global_step,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "config": OmegaConf.to_container(cfg, resolve=True),
-        },
-        checkpoint_path,
-    )
-    logger.info(f"Checkpoint saved to {checkpoint_path}")
+    # Save checkpoint (rank 0 only under DDP). Use model.module.state_dict()
+    # when DDP-wrapped so checkpoint keys match a plain (non-DDP) model.
+    if not is_ddp or rank == 0:
+        checkpoint_path = os.path.join(
+            cfg.training.checkpoint_dir, f"checkpoint_epoch{cfg.training.num_epochs}.pth"
+        )
+        os.makedirs(cfg.training.checkpoint_dir, exist_ok=True)
+        model_to_save = model.module if is_ddp else model
+        torch.save(
+            {
+                "epoch": cfg.training.num_epochs,
+                "global_step": global_step,
+                "model_state_dict": model_to_save.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "config": OmegaConf.to_container(cfg, resolve=True),
+            },
+            checkpoint_path,
+        )
+        logger.info(f"Checkpoint saved to {checkpoint_path}")
+
+    # Sync all ranks before tearing down the process group so the save
+    # completes on rank 0 before any rank exits.
+    if is_ddp:
+        dist.barrier()
 
     close_loggers(tb_writer=tb_writer, wandb_run=wandb_run)
+
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

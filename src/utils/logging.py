@@ -15,43 +15,49 @@ def setup_logging(
     wandb_entity: Optional[str] = None,
     wandb_offline: bool = False,
     config: Optional[Dict[str, Any]] = None,
+    rank: int = 0,
 ) -> Dict[str, Any]:
     """
     Setup logging (console + file) and optional TensorBoard/WandB.
+    When rank > 0 (non-zero DDP ranks), the file handler is skipped,
+    the console handler is set to WARNING, and TB/WandB are disabled.
     Returns dictionary with loggers and writers.
     """
     os.makedirs(log_dir, exist_ok=True)
 
-    # File handler
-    log_file = os.path.join(
-        log_dir, f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    )
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(level)
+    # File handler (only rank 0 writes to file)
+    if rank == 0:
+        log_file = os.path.join(
+            log_dir, f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(level)
 
     # Console handler
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(level)
+    console_handler.setLevel(level if rank == 0 else logging.WARNING)
 
     # Formatter
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    file_handler.setFormatter(formatter)
+    if rank == 0:
+        file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
 
     # Root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
-    root_logger.addHandler(file_handler)
+    if rank == 0:
+        root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
     # Module logger
     logger = logging.getLogger(name)
 
-    # TensorBoard SummaryWriter
+    # TensorBoard SummaryWriter (rank 0 only)
     tb_writer = None
-    if tensorboard:
+    if tensorboard and rank == 0:
         from torch.utils.tensorboard import SummaryWriter
 
         tb_dir = os.path.join(log_dir, "tensorboard")
@@ -59,9 +65,9 @@ def setup_logging(
         tb_writer = SummaryWriter(tb_dir)
         logger.info(f"TensorBoard logging to {tb_dir}")
 
-    # WandB run
+    # WandB run (rank 0 only)
     wandb_run = None
-    if wandb:
+    if wandb and rank == 0:
         import wandb as wandb_lib
 
         wandb_run = wandb_lib.init(
