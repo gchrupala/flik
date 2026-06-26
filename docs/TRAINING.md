@@ -92,7 +92,7 @@ All configuration is in `src/configs/default.yaml`. Key sections:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `lr` | 1e-3 | Learning rate for new modules (projection heads, temporal transformer, cross-modal) |
-| `encoder_lr` | 1e-5 | Learning rate for pretrained encoders (after warmup unfreeze) |
+| `encoder_lr` | 5e-6 | Learning rate for pretrained encoders (after warmup unfreeze). Halved from 1e-5 to reduce the post-unfreeze shock that triggered embedding collapse (see [Anti-collapse measures](#anti-collapse-measures)). |
 | `weight_decay` | 0.01 | AdamW weight decay |
 | `betas` | [0.9, 0.999] | AdamW betas |
 
@@ -110,9 +110,11 @@ All configuration is in `src/configs/default.yaml`. Key sections:
 |-----------|---------|-------------|
 | `contrastive_weight` | 1.0 | Weight for contrastive loss |
 | `mlm_weight` | 0.0 | Weight for MLM loss (0 = disabled) |
-| `temperature` | 0.07 | InfoNCE/DCL temperature |
+| `temperature` | 0.1 | InfoNCE/DCL temperature. Raised from 0.07 — a softer softmax reduces collapse risk under DCL with few negatives (see [Anti-collapse measures](#anti-collapse-measures)). |
 | `use_dcl` | true | Use DCL (Decoupled Contrastive Learning) instead of InfoNCE |
 | `mlm_label_smoothing` | 0.0 | Label smoothing for MLM (unused if mlm_weight=0) |
+| `variance_weight` | 0.5 | VICReg variance regularization weight. Penalizes embedding collapse (per-dim std → 0). 0 disables. |
+| `variance_gamma` | null | Target per-dim std for variance reg. `null` = auto `1/sqrt(hidden_dim)` ≈ 0.036 for L2-normalized 768-d embeddings. |
 
 ## Key design decisions
 
@@ -127,6 +129,8 @@ L_DCL     = -s_ii/τ + log( Σ_{j≠i} exp(s_ij/τ) )
 
 **Why**: InfoNCE has a batch-size-dependent floor of `ln(batch_size)`. At batch size 8, the loss is stuck at `ln(8) ≈ 2.08` with no gradient signal. DCL removes this coupling, making smaller batch sizes viable. At batch size 64, DCL provides strong gradients from 63 negatives without the positive-negative coupling effect.
 
+**Collapse caveat**: DCL has a stable collapsed equilibrium at `ln(N-1)` (≈4.14 for batch 64). When all embeddings become identical, the positive term `-s_ii/τ` and the negative `logsumexp` term nearly cancel, leaving a near-zero gradient — the model can sit there indefinitely. This is exactly what was observed after encoder unfreezing (loss frozen at 4.143, `sim_diag ≈ sim_offdiag ≈ 0.9997`, accuracy = 1/64). The [anti-collapse measures](#anti-collapse-measures) below address this.
+
 To switch back to InfoNCE: `loss.use_dcl=false`.
 
 ### Encoder warmup
@@ -137,9 +141,27 @@ Pretrained encoders (Wav2Vec2, VideoMAE) are **frozen for the first 5 epochs** b
 - The projection heads learn to map frozen encoder features to the contrastive space
 - LR is 1e-3 (high) since only new modules are trainable
 
-After epoch 5, encoders are unfrozen with a lower LR (`encoder_lr=1e-5`) to fine-tune without destroying pretrained features.
+After epoch 5, encoders are unfrozen with a lower LR (`encoder_lr=5e-6`) to fine-tune without destroying pretrained features.
 
 **Why**: Without warmup, random projection heads scramble pretrained features. The contrastive signal is too weak (especially at small batch sizes) for the model to bootstrap. Freezing encoders lets the projection heads learn a useful mapping first.
+
+**How the unfreeze is done matters**: the encoder parameters are added to the *existing* optimizer via `optimizer.add_param_group()` rather than rebuilding a fresh optimizer. Rebuilding destroys the Adam momentum (`exp_avg` / `exp_avg_sq`) the projection heads accumulated during the freeze phase, so the first post-unfreeze step applies a raw `lr·grad` update with no momentum smoothing — a large shock that, combined with the low-temperature DCL loss, reliably triggers embedding collapse within ~2 epochs. `add_param_group` preserves the optimizer state, and the cosine scheduler's current lambda multiplier applies to the encoder's lower base LR, giving the encoder a natural warmup ramp too.
+
+### Anti-collapse measures
+
+A prior training run collapsed immediately after the encoder unfreeze at epoch 6: loss froze at `ln(63) ≈ 4.143`, `sim_diag_mean ≈ sim_offdiag_mean ≈ 0.9997` (all embeddings identical), and `contrastive_acc` stuck at `1/64` (random chance). The run then hit a CUDA OOM from memory fragmentation ~20 epochs later. Five changes address both issues:
+
+1. **`add_param_group` instead of optimizer rebuild** (see [Encoder warmup](#encoder-warmup)). Preserves Adam momentum for the projection heads at unfreeze, eliminating the raw-`lr·grad` shock that kicked off collapse. This is the root-cause fix.
+
+2. **VICReg variance regularization** (`loss.variance_weight=0.5`). Adds a term that penalizes low per-dimension std across the batch: `mean(relu(γ − std(z, dim=0)))`. This makes the collapsed solution a *high*-loss state instead of the near-zero-gradient equilibrium DCL settles into. `γ` auto-computes to `1/sqrt(hidden_dim) ≈ 0.036`, matching the healthy std of L2-normalized 768-d embeddings. Logged as `train/variance_loss`. Set `variance_weight=0` to disable.
+
+3. **Lower `encoder_lr` (1e-5 → 5e-6)**. Halves the magnitude of the post-unfreeze perturbation to the pretrained weights, reducing the chance of a feature-distribution shift large enough to trigger collapse.
+
+4. **Higher `temperature` (0.07 → 0.1)**. A softer softmax gives smoother, less peaky gradients, making it harder for the model to overshoot into the collapsed basin. 0.07 is aggressive for a setup with only 63 negatives and a tiny (2814-segment) dataset.
+
+5. **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`**. Set automatically at the top of `train_hydra.py` (overridable via the environment). Reduces CUDA fragmentation over long runs, preventing the "reserved but unallocated" OOM that appeared after ~26 epochs. The earlier LR-scheduler cycling bug (cosine `progress > 1.0` wrapping back up, and a closure capturing `global_step` by reference) was also fixed in the same pass — `progress` is now clamped to 1.0.
+
+These are belt-and-suspenders: fix 1 removes the trigger, fix 2 makes collapse non-viable regardless of trigger, and fixes 3–4 reduce general collapse susceptibility. Fix 5 is independent.
 
 ### Projection head expansion
 
@@ -182,6 +204,7 @@ Every `log_frequency` steps, the following metrics are logged to TensorBoard/Wan
 | `train/loss` | Total loss |
 | `train/contrastive_loss` | Contrastive loss (DCL or InfoNCE) |
 | `train/contrastive_acc` | Batch retrieval accuracy (argmax of similarity matrix) |
+| `train/variance_loss` | VICReg variance regularization loss (0 when embeddings are well-spread; rises as std drops toward collapse) |
 | `train/lr` | Current learning rate |
 | `train/audio_emb_std` | Std of audio embeddings (collapse detection) |
 | `train/video_emb_std` | Std of video embeddings (collapse detection) |
@@ -195,8 +218,9 @@ Every `log_frequency` steps, the following metrics are logged to TensorBoard/Wan
 Watch these signals for embedding collapse:
 
 - **`train/audio_emb_std` and `train/video_emb_std`**: Should be > 0.01. If approaching 0, embeddings are collapsing.
-- **`train/sim_diag_mean` vs `train/sim_offdiag_mean`**: The gap should grow over training. If both converge to the same value, the model isn't learning to discriminate.
+- **`train/sim_diag_mean` vs `train/sim_offdiag_mean`**: The gap should grow over training. If both converge to the same value (e.g. both ≈ 0.9997), the model has collapsed — all embeddings are nearly identical.
 - **`train/contrastive_acc`**: Should increase above `1/batch_size` (1.56% for B=64). If stuck at chance, the model isn't learning.
+- **`train/variance_loss`**: Should stay near 0 when embeddings are well-spread. If it rises, the variance regularizer is actively fighting collapse; if it stays high while `contrastive_loss` is frozen, the model is stuck in the collapsed basin.
 
 ### Retrieval evaluation
 
@@ -219,7 +243,7 @@ tensorboard --logdir logdir
 [audio] → Wav2Vec2-base (layer 7) → mean-pool → audio_proj (768→1536→768) → L2-norm → audio_embedding
 [video] → VideoMAE-base (16 frames) → mean-pool spatial → temporal transformer (2 layers) → CLS → video_proj (768→1536→768) → L2-norm → video_embedding
 
-Loss: DCL(audio_embedding, video_embedding, τ=0.07)
+Loss: DCL(audio_embedding, video_embedding, τ=0.1) + 0.5 · VICReg-variance(γ=1/√768)
 ```
 
 ### Audio encoder (`src/models/audio_encoder.py`)
@@ -252,7 +276,8 @@ Loss: DCL(audio_embedding, video_embedding, τ=0.07)
 
 ### Loss (`src/models/losses.py`)
 
-- **Contrastive**: DCL (default) or InfoNCE, symmetric, temperature 0.07
+- **Contrastive**: DCL (default) or InfoNCE, symmetric, temperature 0.1
+- **Variance (VICReg)**: Anti-collapse regularizer (`variance_weight=0.5`), target std `γ=1/sqrt(768)`. Penalizes the collapsed equilibrium where all embeddings become identical.
 - **MLM**: Disabled by default (`mlm_weight=0.0`). When enabled, uses a frozen random `target_projection` as teacher — **this is broken** and should not be enabled until a real teacher is implemented.
 
 ## Checkpointing

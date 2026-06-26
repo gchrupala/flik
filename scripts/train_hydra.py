@@ -21,6 +21,10 @@ os.environ["TRANSFORMERS_CACHE"] = os.path.join(
     os.path.dirname(__file__), "..", "cache"
 )
 os.environ["HF_HOME"] = os.path.join(os.path.dirname(__file__), "..", "cache")
+# Reduce CUDA memory fragmentation over long training runs (prevents the
+# "reserved but unallocated" OOM that appears after many epochs). setdefault
+# lets an externally-exported value win.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.nn as nn
@@ -142,9 +146,10 @@ def train_one_epoch(
     model.train()
     total_loss = 0.0
     total_contrastive_loss = 0.0
-    total_mlm_loss = 0.0
     total_contrastive_acc = 0.0
+    total_mlm_loss = 0.0
     total_mlm_acc = 0.0
+    total_variance_loss = 0.0
     num_steps = 0
 
     use_amp = scaler is not None
@@ -215,6 +220,7 @@ def train_one_epoch(
         total_contrastive_acc += metrics.get("contrastive_acc", 0.0)
         total_mlm_loss += metrics.get("mlm_loss", 0.0)
         total_mlm_acc += metrics.get("mlm_acc", 0.0)
+        total_variance_loss += metrics.get("variance_loss", 0.0)
         num_steps += 1
 
         # Log according to frequency
@@ -240,6 +246,7 @@ def train_one_epoch(
                     "train/contrastive_acc": metrics.get("contrastive_acc", 0.0),
                     "train/mlm_loss": metrics.get("mlm_loss", 0.0),
                     "train/mlm_acc": metrics.get("mlm_acc", 0.0),
+                    "train/variance_loss": metrics.get("variance_loss", 0.0),
                     "train/lr": scheduler.get_last_lr()[0],
                     "train/audio_emb_std": audio_emb.std().item(),
                     "train/video_emb_std": video_emb.std().item(),
@@ -262,6 +269,7 @@ def train_one_epoch(
     avg_contrastive_acc = total_contrastive_acc / num_steps if num_steps > 0 else 0.0
     avg_mlm_loss = total_mlm_loss / num_steps if num_steps > 0 else 0.0
     avg_mlm_acc = total_mlm_acc / num_steps if num_steps > 0 else 0.0
+    avg_variance_loss = total_variance_loss / num_steps if num_steps > 0 else 0.0
 
     log_metrics(
         global_step,
@@ -271,6 +279,7 @@ def train_one_epoch(
             "epoch/avg_contrastive_acc": avg_contrastive_acc,
             "epoch/avg_mlm_loss": avg_mlm_loss,
             "epoch/avg_mlm_acc": avg_mlm_acc,
+            "epoch/avg_variance_loss": avg_variance_loss,
             "epoch": epoch,
         },
         tb_writer=tb_writer,
@@ -415,12 +424,16 @@ def main(cfg: DictConfig):
         temperature=cfg.loss.temperature,
         use_dcl=cfg.loss.get("use_dcl", True),
         mlm_label_smoothing=cfg.loss.mlm_label_smoothing,
+        variance_weight=cfg.loss.get("variance_weight", 0.0),
+        variance_gamma=cfg.loss.get("variance_gamma", None),
+        hidden_dim=cfg.model.hidden_dim,
     ).to(device)
     logger.info(
         f"Loss: contrastive_weight={cfg.loss.contrastive_weight}, "
         f"mlm_weight={cfg.loss.mlm_weight}, "
         f"use_dcl={cfg.loss.get('use_dcl', True)}, "
-        f"temperature={cfg.loss.temperature}"
+        f"temperature={cfg.loss.temperature}, "
+        f"variance_weight={cfg.loss.get('variance_weight', 0.0)}"
     )
 
     # Optimizer with separate param groups
@@ -489,33 +502,34 @@ def main(cfg: DictConfig):
         # Unfreeze encoders after warmup
         if freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs + 1:
             unfreeze_encoders(model)
-            # Rebuild optimizer to include encoder params
-            param_groups, n_new, n_enc = build_param_groups(
-                model, cfg.optimizer.lr, encoder_lr, cfg.optimizer.weight_decay
-            )
-            optimizer = AdamW(
-                param_groups,
-                weight_decay=cfg.optimizer.weight_decay,
-                betas=tuple(cfg.optimizer.betas),
-                eps=cfg.optimizer.eps,
-            )
-            # Rebuild scheduler to continue from current step.
-            # CRITICAL: capture global_step by VALUE (default arg), not by reference.
-            # Python closures capture variables, not values — if global_step is
-            # reassigned in main() each epoch, the lambda would see the updated
-            # value, causing the effective step to grow at ~2x the correct rate.
-            step_offset = global_step
-            scheduler = LambdaLR(
-                optimizer,
-                lr_lambda=lambda step, offset=step_offset: cosine_with_warmup_lambda(
-                    step + offset, warmup_steps, total_steps
-                ),
+            # Add encoder params as a NEW param group instead of rebuilding the
+            # optimizer. Rebuilding destroys the Adam momentum (exp_avg /
+            # exp_avg_sq) that the projection heads built up over the freeze
+            # phase, so the first post-unfreeze step applies a raw lr*grad
+            # update with no momentum smoothing — a large shock that, combined
+            # with the low-temperature DCL loss, reliably triggers embedding
+            # collapse within ~2 epochs. add_param_group preserves the
+            # existing optimizer state for the new-module params and lets the
+            # scheduler's current lambda multiplier apply to the encoder's
+            # lower base_lr, giving the encoder a natural warmup ramp too.
+            encoder_params = [
+                p for n, p in model.named_parameters()
+                if _is_encoder_param(n) and p.requires_grad
+            ]
+            optimizer.add_param_group(
+                {
+                    "params": encoder_params,
+                    "lr": encoder_lr,
+                    "weight_decay": cfg.optimizer.weight_decay,
+                    "name": "encoder",
+                }
             )
             trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             logger.info(
                 f"Encoders UNFROZEN at epoch {epoch}. "
                 f"Trainable params: {trainable_params:,}. "
-                f"Optimizer rebuilt with encoder_lr={encoder_lr}"
+                f"Added encoder param group (lr={encoder_lr}) to existing optimizer "
+                f"(Adam momentum preserved)."
             )
 
         logger.info(f"--- Epoch {epoch}/{cfg.training.num_epochs} ---")

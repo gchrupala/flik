@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,6 +64,33 @@ class ContrastiveLoss(nn.Module):
             "contrastive_acc": acc,
         }
         return loss, metrics
+
+
+class VarianceLoss(nn.Module):
+    """
+    VICReg-style variance regularization.
+
+    Penalizes embeddings whose per-dimension std (across the batch) falls below
+    a target ``gamma``. This makes the collapsed solution — where every sample
+    maps to the same vector (std -> 0) — a *high*-loss state instead of the
+    near-zero-gradient equilibrium that pure DCL/InfoNCE settle into.
+
+    For L2-normalized D-dim embeddings the healthy per-dim std is ~1/sqrt(D),
+    so ``gamma`` defaults to that value (auto-computed from ``hidden_dim``).
+    """
+
+    def __init__(self, gamma: float = 1.0, eps: float = 1e-4):
+        super().__init__()
+        self.gamma = gamma
+        self.eps = eps
+
+    def forward(self, *embeddings: torch.Tensor) -> torch.Tensor:
+        loss = embeddings[0].new_tensor(0.0)
+        for z in embeddings:
+            # std per dimension across the batch (biased estimator + eps)
+            std = torch.sqrt(z.var(dim=0, unbiased=False) + self.eps)
+            loss = loss + torch.mean(torch.relu(self.gamma - std))
+        return loss / len(embeddings)
 
 
 class MLMLoss(nn.Module):
@@ -135,12 +163,20 @@ class CombinedLoss(nn.Module):
         temperature: float = 0.07,
         mlm_label_smoothing: float = 0.0,
         use_dcl: bool = True,
+        variance_weight: float = 0.0,
+        variance_gamma: Optional[float] = None,
+        hidden_dim: int = 768,
     ):
         super().__init__()
         self.contrastive_weight = contrastive_weight
         self.mlm_weight = mlm_weight
+        self.variance_weight = variance_weight
         self.contrastive = ContrastiveLoss(temperature, use_dcl=use_dcl)
         self.mlm = MLMLoss(label_smoothing=mlm_label_smoothing)
+        # VICReg variance target: ~1/sqrt(D) for L2-normalized embeddings.
+        if variance_gamma is None:
+            variance_gamma = 1.0 / math.sqrt(hidden_dim)
+        self.variance = VarianceLoss(gamma=variance_gamma)
 
     def forward(
         self,
@@ -163,6 +199,12 @@ class CombinedLoss(nn.Module):
             )
             total_loss += self.contrastive_weight * loss_cont
             metrics.update(metrics_cont)
+
+        # VICReg variance regularization (anti-collapse)
+        if self.variance_weight > 0:
+            loss_var = self.variance(audio_embeddings, video_embeddings)
+            total_loss = total_loss + self.variance_weight * loss_var
+            metrics["variance_loss"] = loss_var.item()
 
         # MLM loss
         if (

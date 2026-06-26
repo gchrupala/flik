@@ -58,7 +58,7 @@ training:
 optimizer:
   type: "adamw"
   lr: 1.0e-3  # LR for new modules (projection heads, temporal transformer, cross-modal)
-  encoder_lr: 1.0e-5  # LR for pretrained encoders (wav2vec2, videomae) after warmup
+  encoder_lr: 5.0e-6  # LR for pretrained encoders (wav2vec2, videomae) after warmup — halved from 1e-5 to reduce the post-unfreeze shock that triggered collapse
   weight_decay: 0.01
   betas: [0.9, 0.999]
   eps: 1.0e-8
@@ -74,9 +74,11 @@ scheduler:
 loss:
   contrastive_weight: 1.0
   mlm_weight: 0.0  # MLM disabled (no valid teacher); set >0 only with a real quantizer
-  temperature: 0.07
+  temperature: 0.1  # raised from 0.07 — softer softmax reduces collapse risk under DCL with few negatives
   use_dcl: true  # Decoupled Contrastive Learning — removes batch-size dependence
   mlm_label_smoothing: 0.0
+  variance_weight: 0.5  # VICReg variance regularization — penalizes embedding collapse (std -> 0); 0 disables
+  variance_gamma: null  # target per-dim std; null = auto 1/sqrt(hidden_dim) ≈ 0.036 for L2-normalized 768-d embeddings
 
 # Logging
 logging:
