@@ -8,14 +8,16 @@ This guide covers training configuration, commands, monitoring, and the model ar
 
 Snellius A100 slice: 1× A100 40GB GPU, 18 CPU cores, 120GB RAM.
 
-**Prerequisite**: Build the training manifest first (see [DATASET_SETUP.md](DATASET_SETUP.md)). The default config expects `data/expanded_manifest_segments_validated.json`, produced by the expand+validate fast path:
+**Prerequisite**: Build the training manifest first (see [DATASET_SETUP.md](DATASET_SETUP.md)). The default config expects `data/expanded_manifest_segments.json`, produced by the expand script:
 
 ```bash
 # After stages 1-2 (transcription + batch_manifest.json):
 uv run --extra cu128 python -m scripts.expand_and_validate_manifest
 ```
 
-This expands ALL transcript segments (3-10s duration filter) and load-test-validates them, bypassing the CLIP correspondence filter (stages 3-5) which is unnecessary for audio↔video contrastive learning — audio and video are inherently aligned (same file, same timestamp). The legacy CLIP-filtered manifest `data/filtered_manifest_segments_validated.json` is still available if you prefer it: `dataset.manifest_path=data/filtered_manifest_segments_validated.json`.
+This expands ALL transcript segments (3-10s duration filter) into a segment-level manifest, bypassing the CLIP correspondence segment filter (stages 3-5) which is unnecessary for audio↔video contrastive learning — audio and video are inherently aligned (same file, same timestamp). Pre-validation (decode-testing every segment) is **off by default** — the dataset retries corrupt segments at runtime (3 attempts with random fallback), and the CLIP stages already catch fully-corrupt videos. Use `--validate` to pre-validate if you want upfront corrupt-segment removal.
+
+The legacy CLIP-filtered manifest `data/filtered_manifest_segments_validated.json` is still available if you prefer it: `dataset.manifest_path=data/filtered_manifest_segments_validated.json`.
 
 **With video-level CLIP QC (hybrid)**: to filter out whole videos where the transcript doesn't match the visual content (wrong language, hallucinated speech), run CLIP stages 3-5 first, then expand from the filtered video list:
 
@@ -354,7 +356,7 @@ uv sync --extra cu128
 
 # Build the training manifest (skip if already built)
 # Pure fast path (no CLIP, fastest):
-[[ -f data/expanded_manifest_segments_validated.json ]] || \
+[[ -f data/expanded_manifest_segments.json ]] || \
   uv run --extra cu128 python -m scripts.expand_and_validate_manifest
 
 # Hybrid path (video-level CLIP QC — uncomment if desired):
@@ -367,7 +369,7 @@ torchrun --standalone --nnodes=1 --nproc-per-node="$SLURM_GPUS_ON_NODE" \
 ```
 
 Submit with `sbatch run_train.sh`. Key points for SLURM:
-- The manifest path defaults to `data/expanded_manifest_segments_validated.json` (set in `src/configs/default.yaml`). Override with `dataset.manifest_path=...` if needed.
+- The manifest path defaults to `data/expanded_manifest_segments.json` (set in `src/configs/default.yaml`). Override with `dataset.manifest_path=...` if needed.
 - Per-GPU batch size is `dataloader.batch_size=64`; global batch scales with GPU count.
 - Only rank 0 writes checkpoints/logs — no race conditions.
 - For single-GPU training, replace the `torchrun` line with `uv run --extra cu128 python -m scripts.train_hydra`.

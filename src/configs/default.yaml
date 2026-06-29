@@ -23,7 +23,7 @@ model:
 
 # Dataset
 dataset:
-  manifest_path: "data/expanded_manifest_segments_validated.json"  # expanded + validated segment-level manifest (all transcript segments, no CLIP filter)
+  manifest_path: "data/expanded_manifest_segments.json"  # expanded segment-level manifest (all transcript segments from passing videos, no CLIP segment filter, no pre-validation)
   sample_rate: 16000
   num_frames: 16
   min_duration: 3.0

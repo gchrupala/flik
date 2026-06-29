@@ -1,8 +1,12 @@
 #!/usr/bin/env python
 """
-Expand a video-level batch_manifest.json into a curated segment-level manifest
-by expanding ALL transcript segments (with duration filter) and validating them
-with actual video+audio decode.
+Expand a video-level batch_manifest.json into a segment-level manifest
+by expanding ALL transcript segments (with duration filter). Optionally
+validates segments with actual video+audio decode (use --validate).
+
+Validation is OFF by default — the training dataset retries corrupt segments
+at runtime (3 attempts with random fallback). The CLIP correspondence stages
+(3-4) already decode video frames, so fully-corrupt videos are caught there.
 
 This bypasses the CLIP correspondence filter (stages 3-5) which kneecaps
 training data by only scoring ~5 segments/video. For contrastive audio↔video
@@ -11,8 +15,8 @@ learning the audio and video come from the same file at the same timestamp
 
 Usage:
     uv run --extra cu128 python -m scripts.expand_and_validate_manifest
-    uv run --extra cu128 python -m scripts.expand_and_validate_manifest --input data/batch_manifest.json
-    uv run --extra cu128 python -m scripts.expand_and_validate_manifest --skip-validate
+    uv run --extra cu128 python -m scripts.expand_and_validate_manifest --input data/filtered_manifest.json
+    uv run --extra cu128 python -m scripts.expand_and_validate_manifest --validate
     uv run --extra cu128 python -m scripts.expand_and_validate_manifest --min-duration 2.0 --max-duration 15.0
 """
 
@@ -103,7 +107,7 @@ def _get_validate_segment():
     """Return the validate_segment function (imported or fallback).
 
     Tries to import from the sibling ``scripts/validate_manifest.py`` at
-    call time (lazy import) so that ``--skip-validate`` runs without
+    call time (lazy import) so that ``--validate`` runs without
     triggering the torchvision import chain. Falls back to a local copy
     if the import fails for ANY reason (not just ImportError).
     """
@@ -266,10 +270,11 @@ def print_summary(
     n_failed: int,
     output_path: str,
     elapsed: float = 0.0,
+    validated: bool = False,
 ):
     """Log a funnel summary table."""
     logger.info("=" * 60)
-    logger.info("EXPANSION + VALIDATION SUMMARY")
+    logger.info("EXPANSION SUMMARY")
     logger.info("=" * 60)
     logger.info(f"  Input videos:              {n_videos:>8d}")
     logger.info(f"  Total transcript segments: {n_transcript:>8d}")
@@ -277,12 +282,15 @@ def print_summary(
         logger.info(f"  After duration filter:     {n_dur:>8d}  ({100*n_dur/n_transcript:.1f}%)")
     else:
         logger.info(f"  After duration filter:     {n_dur:>8d}  (N/A%)")
-    if n_dur > 0:
-        logger.info(f"  After validation:          {n_valid:>8d}  ({100*n_valid/n_dur:.1f}%)")
-        if n_failed:
-            logger.info(f"  Failed:                    {n_failed:>8d}  ({100*n_failed/n_dur:.1f}%)")
+    if validated:
+        if n_dur > 0:
+            logger.info(f"  After validation:          {n_valid:>8d}  ({100*n_valid/n_dur:.1f}%)")
+            if n_failed:
+                logger.info(f"  Failed:                    {n_failed:>8d}  ({100*n_failed/n_dur:.1f}%)")
+        else:
+            logger.info(f"  After validation:          {n_valid:>8d}  (N/A%)")
     else:
-        logger.info(f"  After validation:          {n_valid:>8d}  (N/A%)")
+        logger.info(f"  Validation:                SKIPPED (use --validate to enable)")
     logger.info(f"  Output:                    {output_path}")
     if elapsed > 0:
         logger.info(f"  Total time:                {elapsed:.1f}s")
@@ -295,14 +303,14 @@ def print_summary(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Expand video-level manifest to validated segment-level manifest",
+        description="Expand video-level manifest to segment-level manifest (validation opt-in via --validate)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   uv run --extra cu128 python -m scripts.expand_and_validate_manifest
-  uv run --extra cu128 python -m scripts.expand_and_validate_manifest --input data/batch_manifest.json
-  uv run --extra cu128 python -m scripts.expand_and_validate_manifest --skip-validate
-  uv run --extra cu128 python -m scripts.expand_and_validate_manifest --min-duration 2.0 --max-duration 15.0 --num-workers 32
+  uv run --extra cu128 python -m scripts.expand_and_validate_manifest --input data/filtered_manifest.json
+  uv run --extra cu128 python -m scripts.expand_and_validate_manifest --validate
+  uv run --extra cu128 python -m scripts.expand_and_validate_manifest --min-duration 2.0 --max-duration 15.0
         """,
     )
     parser.add_argument(
@@ -314,8 +322,8 @@ Examples:
     parser.add_argument(
         "--output",
         type=str,
-        default="data/expanded_manifest_segments_validated.json",
-        help="Output segment-level manifest (default: data/expanded_manifest_segments_validated.json)",
+        default="data/expanded_manifest_segments.json",
+        help="Output segment-level manifest (default: data/expanded_manifest_segments.json)",
     )
     parser.add_argument(
         "--min-duration",
@@ -348,9 +356,11 @@ Examples:
         help="Number of parallel validation workers (default: 16)",
     )
     parser.add_argument(
-        "--skip-validate",
+        "--validate",
         action="store_true",
-        help="Skip the decode validation step (just expand + write)",
+        help="Run decode validation on each segment (slow). Off by default — "
+        "the dataset's runtime retry logic (3 attempts with random fallback) "
+        "handles corrupt segments during training.",
     )
     args = parser.parse_args()
 
@@ -362,8 +372,8 @@ Examples:
     logger.info(f"Input manifest:      {args.input}")
     logger.info(f"Output manifest:     {args.output}")
     logger.info(f"Duration filter:     {args.min_duration}s – {args.max_duration}s")
-    logger.info(f"Validate:            {'SKIP' if args.skip_validate else 'YES'}")
-    if not args.skip_validate:
+    logger.info(f"Validate:            {'YES' if args.validate else 'NO'}")
+    if args.validate:
         logger.info(f"  num_frames:        {args.num_frames}")
         logger.info(f"  sample_rate:       {args.sample_rate}")
         logger.info(f"  num_workers:       {args.num_workers}")
@@ -380,17 +390,12 @@ Examples:
 
     if not segments:
         logger.warning("No segments passed the duration filter — nothing to output.")
-        print_summary(logger, n_videos, n_transcript, 0, 0, 0, output_path)
+        print_summary(logger, n_videos, n_transcript, 0, 0, 0, output_path, validated=False)
         sys.exit(0)
 
     # -- Step 2: Validate (optional) --
-    if args.skip_validate:
-        valid_segments = segments
-        n_failed = 0
-        n_val_total = 0
-        val_elapsed = 0.0
-        logger.info(f"Skipping validation — writing {len(segments)} segments directly")
-    else:
+    validated = args.validate
+    if validated:
         valid_segments, failed, val_elapsed, n_val_total = validate_segments(
             segments, args.num_frames, args.sample_rate, args.num_workers, logger
         )
@@ -403,6 +408,11 @@ Examples:
                 for seg_id, error in failed:
                     f.write(f"{seg_id}\t{error}\n")
             logger.info(f"Failures written to {fail_log} ({n_failed} segments)")
+    else:
+        valid_segments = segments
+        n_failed = 0
+        val_elapsed = 0.0
+        logger.info(f"Validation skipped — writing {len(segments)} segments directly")
 
     # -- Step 3: Write output --
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -421,6 +431,7 @@ Examples:
         n_failed,
         output_path,
         total_elapsed,
+        validated=validated,
     )
 
 

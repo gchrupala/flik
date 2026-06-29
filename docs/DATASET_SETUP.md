@@ -10,13 +10,13 @@ The pipeline has 6 stages. Stages 1-2 (transcription, manifest building) run ind
 |-------|--------|--------|------|
 | 1 | `src.preprocess.transcribe` | `data/transcripts/*.json` + `.srt` + `_language.txt` | Yes |
 | 2 | `src.preprocess.filter_transcripts` | `data/batch_manifest.json` | No |
-| — | `scripts.expand_and_validate_manifest` | `data/expanded_manifest_segments_validated.json` | No |
+| — | `scripts.expand_and_validate_manifest` | `data/expanded_manifest_segments.json` | No |
 | 3 | `src.preprocess.check_correspondance --mode randomized` | `data/alignment_scores_randomized.json` | Yes |
 | 4 | `src.preprocess.check_correspondance --mode main` | `data/alignment_scores.json` + `_segments.json` | Yes |
 | 5 | `src.preprocess.filter_by_correspondence` | `data/filtered_manifest.json` + `_segments.json` | No |
 | 6 | `scripts.validate_manifest` | `data/filtered_manifest_segments_validated.json` | No |
 
-**Final output for training**: `data/expanded_manifest_segments_validated.json` (segment-level manifest with ALL transcript segments that pass the duration filter and load-test validation). This is the **recommended** manifest — built via the [expand + validate fast path](#expand--validate-fast-path--recommended) (optionally with [video-level CLIP QC](#hybrid-workflow-video-level-clip-qc--full-segment-expansion)).
+**Final output for training**: `data/expanded_manifest_segments.json` (segment-level manifest with ALL transcript segments that pass the duration filter). This is the **recommended** manifest — built via the [expand manifest](#expand-manifest-fast-path--recommended) script (optionally with [video-level CLIP QC](#hybrid-workflow-video-level-clip-qc--full-segment-expansion)). Pre-validation (decode-testing every segment) is off by default.
 
 The legacy CLIP-filtered manifest `data/filtered_manifest_segments_validated.json` (stages 3-6) is still available but only keeps ~5 CLIP-scored segments per video. For audio↔video contrastive learning, the CLIP text↔video filter is unnecessary: audio and video come from the same file at the same timestamp, so they are inherently aligned by construction.
 
@@ -72,34 +72,36 @@ uv run --extra cu128 python -m src.preprocess.filter_transcripts
 
 **Output**: `data/batch_manifest.json` — list of `{id, video_path, json_path}` entries.
 
-## Expand + validate (fast path) — RECOMMENDED
+## Expand manifest (fast path) — RECOMMENDED
 
-After stages 1-2, instead of running the CLIP correspondence pipeline (stages 3-6), use the expand+validate script. This expands ALL transcript segments (with the 3-10s duration filter) and load-test-validates them, producing a much larger training manifest.
+After stages 1-2, instead of running the CLIP correspondence pipeline (stages 3-6), use the expand script. This expands ALL transcript segments (with the 3-10s duration filter) into a segment-level manifest, producing a much larger training set. Pre-validation (decode-testing every segment) is **off by default** — use `--validate` to enable it.
 
 ```bash
 uv run --extra cu128 python -m scripts.expand_and_validate_manifest
 ```
 
-**Output**: `data/expanded_manifest_segments_validated.json` — the default training manifest.
+**Output**: `data/expanded_manifest_segments.json` — the default training manifest.
 
 Options:
 ```bash
 uv run --extra cu128 python -m scripts.expand_and_validate_manifest \
   --input data/batch_manifest.json \
-  --output data/expanded_manifest_segments_validated.json \
+  --output data/expanded_manifest_segments.json \
   --min-duration 3.0 \
   --max-duration 10.0 \
   --num-workers 16 \
-  --skip-validate          # skip decode validation (faster, for testing)
+  --validate              # run decode validation (slow, off by default)
 ```
 
-**Why this exists**: The CLIP correspondence filter (stages 3-5) scores only ~5 segments per video against text, then filters by percentile. This is designed for text↔video alignment. But the contrastive task is audio↔video alignment — audio and video are sampled from the same file at the same timestamp, so they are inherently aligned and the text filter is irrelevant. The expand+validate path keeps every segment that loads cleanly, yielding a far larger training set.
+**Why this exists**: The CLIP correspondence filter (stages 3-5) scores only ~5 segments per video against text, then filters by percentile. This is designed for text↔video alignment. But the contrastive task is audio↔video alignment — audio and video are sampled from the same file at the same timestamp, so they are inherently aligned and the text filter is irrelevant. The expand path keeps every segment that loads cleanly, yielding a far larger training set.
+
+**Validation is off by default**: pre-validating every segment by decoding video+audio is slow (I/O-bound). The dataset retries corrupt segments at runtime (3 attempts with random fallback), and the CLIP correspondence stages (3-4) already decode video frames — so fully-corrupt videos are caught there. Use `--validate` if you want upfront corrupt-segment removal.
 
 | Step | Script | Output | GPU? |
 |------|--------|--------|------|
-| Expand + validate | `scripts.expand_and_validate_manifest` | `data/expanded_manifest_segments_validated.json` | No |
+| Expand manifest | `scripts.expand_and_validate_manifest` | `data/expanded_manifest_segments.json` | No |
 
-A failure log is written to `data/expanded_manifest_segments_validated_failures.txt`.
+A failure log is written to `data/expanded_manifest_segments_failures.txt` (only when `--validate` is used).
 
 ### Hybrid workflow (video-level CLIP QC + full segment expansion)
 
@@ -115,8 +117,7 @@ uv run --extra cu128 python -m scripts.preprocess
 # 2. Expand ALL transcript segments from passing videos + validate
 #    (NOT just the ~5 CLIP-scored segments — all of them)
 uv run --extra cu128 python -m scripts.expand_and_validate_manifest \
-  --input data/filtered_manifest.json \
-  --output data/expanded_manifest_segments_validated.json
+  --input data/filtered_manifest.json
 ```
 
 **What this preserves vs. what it drops:**
