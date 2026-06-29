@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from contextlib import nullcontext
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
@@ -200,6 +201,7 @@ def train_one_epoch(
     scaler=None,
     tb_writer=None,
     wandb_run=None,
+    is_ddp=False,
 ):
     model.train()
     total_loss = 0.0
@@ -245,11 +247,23 @@ def train_one_epoch(
         # Scale loss for gradient accumulation
         loss_scaled = loss / accum_steps
 
+        # Under DDP with gradient accumulation (accum_steps > 1), skip the
+        # all-reduce gradient sync on intermediate accumulation steps. Only
+        # the final step triggers a normal backward() which syncs gradients.
+        # With accum_steps=1 (default), every step syncs — no change.
+        is_sync_step = (step + 1) % accum_steps == 0
+        grad_sync_ctx = (
+            model.no_sync()
+            if (is_ddp and accum_steps > 1 and not is_sync_step)
+            else nullcontext()
+        )
+
         # Backward pass (with optional GradScaler)
-        if use_amp:
-            scaler.scale(loss_scaled).backward()
-        else:
-            loss_scaled.backward()
+        with grad_sync_ctx:
+            if use_amp:
+                scaler.scale(loss_scaled).backward()
+            else:
+                loss_scaled.backward()
 
         forward_times.append(time.time() - fwd_t)
 
@@ -698,6 +712,7 @@ def main(cfg: DictConfig):
             scaler=scaler,
             tb_writer=tb_writer,
             wandb_run=wandb_run,
+            is_ddp=is_ddp,
         )
 
         if cfg.training.run_retrieval_eval and (not is_ddp or rank == 0):
