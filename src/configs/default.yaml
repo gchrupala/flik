@@ -98,3 +98,6 @@ hardware:
 validation:
   retrieval_top_k: [1, 5, 10]
   eval_batch_size: 16
+  split_ratio: 0.1            # fraction of unique videos held out for validation (0 = no split, eval on train)
+  split_seed: 42              # deterministic seed for the video-level split
+  select_metric: "mean_r1"    # checkpoint-selection metric: mean of (a2v_r@1 + v2a_r@1)/2

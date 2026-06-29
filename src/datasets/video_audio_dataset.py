@@ -24,6 +24,7 @@ class VideoAudioDataset(Dataset):
         min_duration: float = 3.0,
         max_duration: float = 10.0,
         dummy: bool = False,
+        manifest_items: Optional[List[Dict[str, Any]]] = None,
     ):
         """
         Args:
@@ -40,7 +41,10 @@ class VideoAudioDataset(Dataset):
         self.max_duration = max_duration
         self.dummy = dummy
 
-        if not dummy:
+        if manifest_items is not None:
+            self.manifest = manifest_items
+            self.segments = self._build_segment_list()
+        elif not dummy:
             with open(manifest_path, "r", encoding="utf-8") as f:
                 self.manifest = json.load(f)
             # Precompute segment candidates

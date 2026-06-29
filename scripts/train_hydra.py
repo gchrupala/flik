@@ -15,6 +15,8 @@ Key features:
 import sys
 import os
 import math
+import json
+import random
 
 # Set HuggingFace cache to a local directory to avoid permission issues
 os.environ["TRANSFORMERS_CACHE"] = os.path.join(
@@ -125,6 +127,40 @@ def cosine_with_warmup_lambda(step: int, warmup_steps: int, total_steps: int) ->
     # Clamp to prevent cosine from cycling back up after total_steps
     progress = min(1.0, progress)
     return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _split_manifest_by_video(manifest, val_ratio: float, seed: int):
+    """Split a segment-level manifest into (train_items, val_items) grouped by
+    video so no film appears in both splits (prevents cross-film leakage).
+
+    Groups segments by ``video_id`` (falling back to ``video_path``). Sorts the
+    video keys for determinism, then shuffles with ``seed`` and takes the first
+    ``ceil(n_videos * val_ratio)`` videos as the val set.
+    Returns ([...], [...]). If val_ratio <= 0, returns (manifest, []).
+    Guarantees at least 1 video in each side when val_ratio > 0 and there are
+    >= 2 videos.
+    """
+    if val_ratio <= 0 or len(manifest) == 0:
+        return list(manifest), []
+
+    def _key(item):
+        return item.get("video_id") or item.get("video_path") or item.get("id") or ""
+
+    groups: dict = {}
+    for item in manifest:
+        groups.setdefault(_key(item), []).append(item)
+
+    video_keys = sorted(groups.keys())
+    n_val = max(1, math.ceil(len(video_keys) * val_ratio))
+    n_val = min(n_val, len(video_keys) - 1) if len(video_keys) >= 2 else n_val
+    rng = random.Random(seed)
+    rng.shuffle(video_keys)
+    val_keys = set(video_keys[:n_val])
+
+    train_items, val_items = [], []
+    for k in video_keys:
+        (val_items if k in val_keys else train_items).extend(groups[k])
+    return train_items, val_items
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +417,22 @@ def main(cfg: DictConfig):
         logger.info("cudnn benchmark enabled")
 
     # Dataset & DataLoader
+    # Load manifest once and split into train/val at the video level so no
+    # film appears in both (prevents leakage). split_ratio=0 disables the
+    # split and evaluates on the training set (legacy behavior).
+    with open(cfg.dataset.manifest_path, "r", encoding="utf-8") as _f:
+        full_manifest = json.load(_f)
+    val_ratio = cfg.validation.get("split_ratio", 0.0)
+    split_seed = cfg.validation.get("split_seed", 42)
+    train_items, val_items = _split_manifest_by_video(full_manifest, val_ratio, split_seed)
+    logger.info(
+        f"Manifest split: {len(train_items)} train / {len(val_items)} val segments "
+        f"(val_ratio={val_ratio}, seed={split_seed}, "
+        f"videos={len({i.get('video_id') for i in full_manifest})})"
+    )
+    if not val_items:
+        logger.warning("Validation split is empty — retrieval eval will run on the TRAIN set")
+
     dataset = VideoAudioDataset(
         manifest_path=cfg.dataset.manifest_path,
         sample_rate=cfg.dataset.sample_rate,
@@ -388,6 +440,7 @@ def main(cfg: DictConfig):
         min_duration=cfg.dataset.min_duration,
         max_duration=cfg.dataset.max_duration,
         dummy=cfg.dataset.dummy,
+        manifest_items=train_items,
     )
     # Under DDP, use a DistributedSampler (disjoint shards per rank). The
     # sampler handles shuffling; DataLoader.shuffle must be False when a
@@ -417,6 +470,33 @@ def main(cfg: DictConfig):
     dataloader = DataLoader(dataset, **dl_kwargs)
     logger.info(f"Dataset size: {len(dataset)}")
     logger.info(f"Batch size: {cfg.dataloader.batch_size}" + (f" (per-rank; global={cfg.dataloader.batch_size * world_size})" if is_ddp else ""))
+
+    # Validation dataset/dataloader (rank 0 only under DDP — only rank 0 evals).
+    # drop_last=False and shuffle=False so every val sample is scored once.
+    val_dataloader = None
+    if cfg.training.run_retrieval_eval and val_items and (not is_ddp or rank == 0):
+        val_dataset = VideoAudioDataset(
+            manifest_path=cfg.dataset.manifest_path,
+            sample_rate=cfg.dataset.sample_rate,
+            num_frames=cfg.dataset.num_frames,
+            min_duration=cfg.dataset.min_duration,
+            max_duration=cfg.dataset.max_duration,
+            dummy=cfg.dataset.dummy,
+            manifest_items=val_items,
+        )
+        val_dl_kwargs = dict(
+            batch_size=cfg.validation.eval_batch_size,
+            shuffle=False,
+            collate_fn=VideoAudioDataset.collate_fn,
+            num_workers=cfg.dataloader.num_workers,
+            pin_memory=cfg.dataloader.pin_memory,
+            drop_last=False,
+        )
+        if cfg.dataloader.num_workers > 0:
+            val_dl_kwargs["persistent_workers"] = cfg.dataloader.get("persistent_workers", False)
+            val_dl_kwargs["prefetch_factor"] = cfg.dataloader.get("prefetch_factor", None)
+        val_dataloader = DataLoader(val_dataset, **val_dl_kwargs)
+        logger.info(f"Validation dataset size: {len(val_dataset)} (batch_size={cfg.validation.eval_batch_size})")
 
     # Model
     model = FlikModel(
@@ -564,6 +644,8 @@ def main(cfg: DictConfig):
 
     # Training loop
     global_step = 0
+    best_metric = float("-inf")
+    best_epoch = -1
     for epoch in range(1, cfg.training.num_epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -619,10 +701,40 @@ def main(cfg: DictConfig):
         )
 
         if cfg.training.run_retrieval_eval and (not is_ddp or rank == 0):
-            evaluate_retrieval(
-                cfg, model, dataloader, device, logger, tb_writer, wandb_run, global_step
+            eval_model = model.module if is_ddp else model
+            eval_loader = val_dataloader if val_dataloader is not None else dataloader
+            val_metrics = evaluate_retrieval(
+                cfg, eval_model, eval_loader, device, logger, tb_writer, wandb_run, global_step
             )
+            # Track best checkpoint by the configured selection metric.
+            # Default select_metric="mean_r1" = (a2v_r@1 + v2a_r@1)/2.
+            if val_metrics:
+                sel = cfg.validation.get("select_metric", "mean_r1")
+                if sel == "mean_r1":
+                    m = (val_metrics.get("a2v_r@1", 0.0) + val_metrics.get("v2a_r@1", 0.0)) / 2.0
+                else:
+                    m = val_metrics.get(sel, 0.0)
+                if m > best_metric:
+                    best_metric = m
+                    best_epoch = epoch
+                    if not is_ddp or rank == 0:
+                        best_path = os.path.join(cfg.training.checkpoint_dir, "checkpoint_best.pth")
+                        os.makedirs(cfg.training.checkpoint_dir, exist_ok=True)
+                        model_to_save = model.module if is_ddp else model
+                        torch.save(
+                            {
+                                "epoch": epoch,
+                                "global_step": global_step,
+                                "model_state_dict": model_to_save.state_dict(),
+                                "best_metric": best_metric,
+                                "select_metric": sel,
+                                "config": OmegaConf.to_container(cfg, resolve=True),
+                            },
+                            best_path,
+                        )
+                        logger.info(f"New best {sel}={best_metric:.4f} @ epoch {epoch} — saved {best_path}")
 
+    logger.info(f"Best val {cfg.validation.get('select_metric', 'mean_r1')}={best_metric:.4f} at epoch {best_epoch}")
     logger.info("Training finished")
 
     # Save checkpoint (rank 0 only under DDP). Use model.module.state_dict()
