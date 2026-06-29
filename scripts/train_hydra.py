@@ -78,20 +78,6 @@ def _setup_distributed():
     return rank, world_size, local_rank, True
 
 
-def freeze_encoders(model: nn.Module):
-    """Freeze pretrained encoder parameters."""
-    for name, param in model.named_parameters():
-        if _is_encoder_param(name):
-            param.requires_grad = False
-
-
-def unfreeze_encoders(model: nn.Module):
-    """Unfreeze pretrained encoder parameters."""
-    for name, param in model.named_parameters():
-        if _is_encoder_param(name):
-            param.requires_grad = True
-
-
 def build_param_groups(model: nn.Module, lr: float, encoder_lr: float, weight_decay: float):
     """Create two parameter groups: new modules (lr) and pretrained encoders (encoder_lr)."""
     encoder_params = []
@@ -100,8 +86,6 @@ def build_param_groups(model: nn.Module, lr: float, encoder_lr: float, weight_de
     new_param_names = []
 
     for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
         if _is_encoder_param(name):
             encoder_params.append(param)
             encoder_param_names.append(name)
@@ -363,24 +347,46 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate_retrieval(cfg, model, dataloader, device, logger, tb_writer=None, wandb_run=None, step=0):
+def evaluate_retrieval(cfg, model, dataloader, device, logger, tb_writer=None, wandb_run=None, step=0, is_ddp=False, val_sampler=None):
+    """Compute retrieval R@K on the validation set.
+
+    Under DDP, each rank processes its val shard, then embeddings are
+    all-gathered. Rank 0 computes and logs the final metrics. Non-zero
+    ranks return {} (metrics are only computed on rank 0).
+    """
     model.eval()
     audio_embs = []
     video_embs = []
 
-    for batch in dataloader:
-        audio = batch["audio"].to(device)
-        video = batch["video"].to(device)
-        audio_padding_mask = batch["audio_padding_mask"].to(device)
+    with torch.no_grad():
+        for batch in dataloader:
+            audio = batch["audio"].to(device)
+            video = batch["video"].to(device)
+            audio_padding_mask = batch["audio_padding_mask"].to(device)
 
-        audio_embs.append(model.encode_audio(audio, audio_padding_mask).detach())
-        video_embs.append(model.encode_video(video).detach())
+            audio_embs.append(model.encode_audio(audio, audio_padding_mask).detach())
+            video_embs.append(model.encode_video(video).detach())
 
     if not audio_embs:
         return {}
 
-    audio_embeddings = torch.cat(audio_embs, dim=0)
-    video_embeddings = torch.cat(video_embs, dim=0)
+    audio_embeddings = torch.cat(audio_embs, dim=0)  # (local_N, D)
+    video_embeddings = torch.cat(video_embs, dim=0)  # (local_N, D)
+
+    # Under DDP, all-gather embeddings so rank 0 has the full validation set.
+    if is_ddp and dist.is_available() and dist.is_initialized():
+        # Use plain all_gather (no grad needed during eval)
+        gathered_audio = [torch.zeros_like(audio_embeddings) for _ in range(dist.get_world_size())]
+        gathered_video = [torch.zeros_like(video_embeddings) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered_audio, audio_embeddings)
+        dist.all_gather(gathered_video, video_embeddings)
+        audio_embeddings = torch.cat(gathered_audio, dim=0)  # (global_N, D)
+        video_embeddings = torch.cat(gathered_video, dim=0)
+
+        # Only rank 0 computes and logs the metrics.
+        if dist.get_rank() != 0:
+            return {}
+
     metrics = retrieval_recall_at_k(
         audio_embeddings,
         video_embeddings,
@@ -492,10 +498,13 @@ def main(cfg: DictConfig):
     logger.info(f"Dataset size: {len(dataset)}")
     logger.info(f"Batch size: {cfg.dataloader.batch_size}" + (f" (per-rank; global={cfg.dataloader.batch_size * world_size})" if is_ddp else ""))
 
-    # Validation dataset/dataloader (rank 0 only under DDP — only rank 0 evals).
-    # drop_last=False and shuffle=False so every val sample is scored once.
+    # Validation dataset/dataloader. Under DDP, ALL ranks get a val_dataloader
+    # with a DistributedSampler so eval is parallelized across GPUs. Each rank
+    # computes embeddings for its val shard, then embeddings are all-gathered
+    # and rank 0 computes R@K on the full set.
     val_dataloader = None
-    if cfg.training.run_retrieval_eval and val_items and (not is_ddp or rank == 0):
+    val_sampler = None
+    if cfg.training.run_retrieval_eval and val_items:
         val_dataset = VideoAudioDataset(
             manifest_path=cfg.dataset.manifest_path,
             sample_rate=cfg.dataset.sample_rate,
@@ -505,14 +514,24 @@ def main(cfg: DictConfig):
             dummy=cfg.dataset.dummy,
             manifest_items=val_items,
         )
+        if is_ddp:
+            val_sampler = DistributedSampler(
+                val_dataset, shuffle=False, drop_last=False
+            )
+            val_shuffle = False
+        else:
+            val_sampler = None
+            val_shuffle = False
         val_dl_kwargs = dict(
             batch_size=cfg.validation.eval_batch_size,
-            shuffle=False,
+            shuffle=val_shuffle,
             collate_fn=VideoAudioDataset.collate_fn,
             num_workers=cfg.dataloader.num_workers,
             pin_memory=cfg.dataloader.pin_memory,
             drop_last=False,
         )
+        if val_sampler is not None:
+            val_dl_kwargs["sampler"] = val_sampler
         if cfg.dataloader.num_workers > 0:
             val_dl_kwargs["persistent_workers"] = cfg.dataloader.get("persistent_workers", False)
             val_dl_kwargs["prefetch_factor"] = cfg.dataloader.get("prefetch_factor", None)
@@ -560,21 +579,17 @@ def main(cfg: DictConfig):
         except Exception as e:
             logger.warning(f"Failed to enable gradient checkpointing: {e}")
 
-    # Encoder warmup: freeze pretrained encoders for first N epochs
+    # Encoder warmup: encoder params use lr=0 for first N epochs,
+    # then their param group LR is set to encoder_lr. This keeps all params
+    # in the DDP autograd graph from epoch 0 (no requires_grad toggling,
+    # no add_param_group mid-training — both are DDP-fragile).
     freeze_encoder_epochs = cfg.training.get("freeze_encoder_epochs", 0)
-    if freeze_encoder_epochs > 0:
-        freeze_encoders(model)
-        logger.info(
-            f"Pretrained encoders FROZEN for first {freeze_encoder_epochs} epochs "
-            f"(projection heads + temporal transformer will train)"
-        )
 
-    # Wrap with DDP after moving to device, enabling gradient checkpointing,
-    # and freezing encoders. find_unused_parameters=True is required because
-    # the MLM head is skipped when mlm_weight=0 and the encoders are frozen
-    # pre-unfreeze — those params receive no gradient. gradient_as_bucket_view
-    # reuses gradient bucket memory (small perf win). Do NOT use static_graph
-    # (incompatible with mid-training encoder unfreeze).
+    # Wrap with DDP after moving to device and enabling gradient checkpointing.
+    # find_unused_parameters=True is needed because the MLM head is skipped
+    # when mlm_weight=0. With the lr=0 warmup approach, all params are always
+    # in the autograd graph (no requires_grad toggling) — DDP-robust.
+    # gradient_as_bucket_view reuses gradient bucket memory (small perf win).
     if is_ddp:
         model = DDP(
             model,
@@ -603,14 +618,20 @@ def main(cfg: DictConfig):
         f"variance_weight={cfg.loss.get('variance_weight', 0.0)}"
     )
 
-    # Optimizer with separate param groups
+    # Optimizer with separate param groups.
+    # During encoder warmup (freeze_encoder_epochs > 0), the encoder param
+    # group starts with lr=0 so no gradients are applied to pretrained
+    # weights — but requires_grad stays True so DDP's reducer includes them
+    # from the start. At the unfreeze epoch, the group LR is set to encoder_lr.
     encoder_lr = cfg.optimizer.get("encoder_lr", cfg.optimizer.lr)
+    encoder_init_lr = 0.0 if freeze_encoder_epochs > 0 else encoder_lr
     param_groups, n_new, n_enc = build_param_groups(
-        model, cfg.optimizer.lr, encoder_lr, cfg.optimizer.weight_decay
+        model, cfg.optimizer.lr, encoder_init_lr, cfg.optimizer.weight_decay
     )
     logger.info(
         f"Param groups: {n_new} new-module params (lr={cfg.optimizer.lr}), "
-        f"{n_enc} encoder params (lr={encoder_lr})"
+        f"{n_enc} encoder params (lr={encoder_init_lr})"
+        + (f" [warmup: lr=0 for {freeze_encoder_epochs} epochs]" if freeze_encoder_epochs > 0 else "")
     )
 
     if cfg.optimizer.type == "adamw":
@@ -671,37 +692,19 @@ def main(cfg: DictConfig):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # Unfreeze encoders after warmup
+        # Unfreeze encoders: set the encoder param group's LR from 0 to encoder_lr.
+        # No requires_grad toggling, no add_param_group — the group was in the
+        # optimizer from epoch 0 with lr=0, so DDP's reducer already tracks it.
+        # The scheduler's current lambda multiplier applies on top of this base LR.
         if freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs + 1:
-            unfreeze_encoders(model)
-            # Add encoder params as a NEW param group instead of rebuilding the
-            # optimizer. Rebuilding destroys the Adam momentum (exp_avg /
-            # exp_avg_sq) that the projection heads built up over the freeze
-            # phase, so the first post-unfreeze step applies a raw lr*grad
-            # update with no momentum smoothing — a large shock that, combined
-            # with the low-temperature DCL loss, reliably triggers embedding
-            # collapse within ~2 epochs. add_param_group preserves the
-            # existing optimizer state for the new-module params and lets the
-            # scheduler's current lambda multiplier apply to the encoder's
-            # lower base_lr, giving the encoder a natural warmup ramp too.
-            encoder_params = [
-                p for n, p in model.named_parameters()
-                if _is_encoder_param(n) and p.requires_grad
-            ]
-            optimizer.add_param_group(
-                {
-                    "params": encoder_params,
-                    "lr": encoder_lr,
-                    "weight_decay": cfg.optimizer.weight_decay,
-                    "name": "encoder",
-                }
-            )
-            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            for group in optimizer.param_groups:
+                if group.get("name") == "encoder":
+                    group["lr"] = encoder_lr
+                    break
             logger.info(
                 f"Encoders UNFROZEN at epoch {epoch}. "
-                f"Trainable params: {trainable_params:,}. "
-                f"Added encoder param group (lr={encoder_lr}) to existing optimizer "
-                f"(Adam momentum preserved)."
+                f"Encoder param group lr set to {encoder_lr}. "
+                f"(Param group already in optimizer since epoch 0 — Adam state initialized during warmup.)"
             )
 
         logger.info(f"--- Epoch {epoch}/{cfg.training.num_epochs} ---")
@@ -722,11 +725,15 @@ def main(cfg: DictConfig):
             is_ddp=is_ddp,
         )
 
-        if cfg.training.run_retrieval_eval and (not is_ddp or rank == 0):
+        if cfg.training.run_retrieval_eval and val_dataloader is not None:
             eval_model = model.module if is_ddp else model
-            eval_loader = val_dataloader if val_dataloader is not None else dataloader
+            # Under DDP, set the val sampler epoch so sharding is deterministic
+            # (though shuffle=False, set_epoch is good practice).
+            if val_sampler is not None:
+                val_sampler.set_epoch(epoch)
             val_metrics = evaluate_retrieval(
-                cfg, eval_model, eval_loader, device, logger, tb_writer, wandb_run, global_step
+                cfg, eval_model, val_dataloader, device, logger, tb_writer, wandb_run, global_step,
+                is_ddp=is_ddp, val_sampler=val_sampler,
             )
             # Track best checkpoint by the configured selection metric.
             # Default select_metric="mean_r1" = (a2v_r@1 + v2a_r@1)/2.
