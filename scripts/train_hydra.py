@@ -168,7 +168,7 @@ def _split_manifest_by_video(manifest, val_ratio: float, seed: int):
 # Logging
 # ---------------------------------------------------------------------------
 
-def setup_logging(cfg, log_dir):
+def setup_logging(cfg, log_dir, rank=0):
     loggers = flik_setup_logging(
         log_dir=log_dir,
         name="flik",
@@ -178,6 +178,7 @@ def setup_logging(cfg, log_dir):
         wandb_entity=cfg.logging.wandb.entity,
         wandb_offline=cfg.logging.wandb.offline,
         config=OmegaConf.to_container(cfg, resolve=True),
+        rank=rank,
     )
     loggers["logger"].info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
     return loggers
@@ -431,21 +432,27 @@ def main(cfg: DictConfig):
         logger.info("cudnn benchmark enabled")
 
     # Dataset & DataLoader
-    # Load manifest once and split into train/val at the video level so no
-    # film appears in both (prevents leakage). split_ratio=0 disables the
-    # split and evaluates on the training set (legacy behavior).
-    with open(cfg.dataset.manifest_path, "r", encoding="utf-8") as _f:
-        full_manifest = json.load(_f)
-    val_ratio = cfg.validation.get("split_ratio", 0.0)
-    split_seed = cfg.validation.get("split_seed", 42)
-    train_items, val_items = _split_manifest_by_video(full_manifest, val_ratio, split_seed)
-    logger.info(
-        f"Manifest split: {len(train_items)} train / {len(val_items)} val segments "
-        f"(val_ratio={val_ratio}, seed={split_seed}, "
-        f"videos={len({i.get('video_id') for i in full_manifest})})"
-    )
-    if not val_items:
-        logger.warning("Validation split is empty — retrieval eval will run on the TRAIN set")
+    # In dummy mode, skip manifest I/O entirely and let the dataset generate
+    # random tensors (fast smoke test of the training loop without disk I/O).
+    # Otherwise, load manifest once and split into train/val at the video
+    # level so no film appears in both (prevents leakage). split_ratio=0
+    # disables the split and evaluates on the training set (legacy behavior).
+    train_items, val_items = None, []
+    if cfg.dataset.dummy:
+        logger.info("Dummy mode: skipping manifest load (random tensors)")
+    else:
+        with open(cfg.dataset.manifest_path, "r", encoding="utf-8") as _f:
+            full_manifest = json.load(_f)
+        val_ratio = cfg.validation.get("split_ratio", 0.0)
+        split_seed = cfg.validation.get("split_seed", 42)
+        train_items, val_items = _split_manifest_by_video(full_manifest, val_ratio, split_seed)
+        logger.info(
+            f"Manifest split: {len(train_items)} train / {len(val_items)} val segments "
+            f"(val_ratio={val_ratio}, seed={split_seed}, "
+            f"videos={len({i.get('video_id') for i in full_manifest})})"
+        )
+        if not val_items:
+            logger.warning("Validation split is empty — retrieval eval will run on the TRAIN set")
 
     dataset = VideoAudioDataset(
         manifest_path=cfg.dataset.manifest_path,
