@@ -8,7 +8,27 @@ This guide covers training configuration, commands, monitoring, and the model ar
 
 Snellius A100 slice: 1× A100 40GB GPU, 18 CPU cores, 120GB RAM.
 
-**Prerequisite**: Run the data pipeline first (see [DATASET_SETUP.md](DATASET_SETUP.md)). The default config expects `data/filtered_manifest_segments_validated.json` (produced by Stage 6 validation). If you only have `data/filtered_manifest_segments.json` (unvalidated), either run validation first or override the path: `dataset.manifest_path=data/filtered_manifest_segments.json`.
+**Prerequisite**: Build the training manifest first (see [DATASET_SETUP.md](DATASET_SETUP.md)). The default config expects `data/expanded_manifest_segments_validated.json`, produced by the expand+validate fast path:
+
+```bash
+# After stages 1-2 (transcription + batch_manifest.json):
+uv run --extra cu128 python -m scripts.expand_and_validate_manifest
+```
+
+This expands ALL transcript segments (3-10s duration filter) and load-test-validates them, bypassing the CLIP correspondence filter (stages 3-5) which is unnecessary for audio↔video contrastive learning — audio and video are inherently aligned (same file, same timestamp). The legacy CLIP-filtered manifest `data/filtered_manifest_segments_validated.json` is still available if you prefer it: `dataset.manifest_path=data/filtered_manifest_segments_validated.json`.
+
+**With video-level CLIP QC (hybrid)**: to filter out whole videos where the transcript doesn't match the visual content (wrong language, hallucinated speech), run CLIP stages 3-5 first, then expand from the filtered video list:
+
+```bash
+# 1. CLIP video-level filter (GPU) → data/filtered_manifest.json
+uv run --extra cu128 python -m scripts.preprocess
+
+# 2. Expand all segments from passing videos + validate
+uv run --extra cu128 python -m scripts.expand_and_validate_manifest \
+  --input data/filtered_manifest.json
+```
+
+See [DATASET_SETUP.md](DATASET_SETUP.md#hybrid-workflow-video-level-clip-qc--full-segment-expansion) for the full comparison of paths.
 
 ```bash
 uv run --extra cu128 python -m scripts.train_hydra
@@ -233,7 +253,7 @@ tensorboard --logdir logdir
 # Or in WandB (set logging.use_wandb=true)
 ```
 
-> **Note**: Retrieval eval currently runs on the training dataloader, not a held-out validation set. This is a known limitation — add a real validation split for proper evaluation.
+> **Validation split**: A fraction of videos (`validation.split_ratio=0.1`, default) is held out from training and used for retrieval evaluation after each epoch. The split is grouped by `video_id` (deterministic, seeded by `validation.split_seed=42`) so no film appears in both train and validation — preventing leakage. Metrics are logged as `val/a2v_r@1`, `val/v2a_r@1`, `val/mean_r1`, etc. Set `validation.split_ratio=0` to disable and eval on the training set.
 
 ## Model architecture
 
@@ -282,7 +302,7 @@ Loss: DCL(audio_embedding, video_embedding, τ=0.1) + 0.5 · VICReg-variance(γ=
 
 ## Checkpointing
 
-Checkpoints are saved at the end of training to `checkpoints/checkpoint_epoch{N}.pth`:
+Checkpoints are saved at the end of each epoch to `checkpoints/checkpoint_epoch{N}.pth`:
 
 ```python
 {
@@ -295,6 +315,10 @@ Checkpoints are saved at the end of training to `checkpoints/checkpoint_epoch{N}
 }
 ```
 
+A **best checkpoint** `checkpoints/checkpoint_best.pth` tracks the model with the highest `validation.select_metric` (default `mean_r1` = mean of audio→video and video→audio Recall@1 on the held-out split). This is the checkpoint to use for downstream evaluation — DCL contrastive loss has no lower bound (it goes negative when positive similarity exceeds the negative logsumexp), so it is not a reliable model-selection signal.
+
+> When `validation.split_ratio=0` (no held-out split), best-checkpoint tracking falls back to training-set `mean_r1`.
+
 ## Cluster execution
 
 ### SLURM
@@ -305,19 +329,79 @@ SLURM job scripts: `run_transcription.sh`, `run_correpond.sh`. Submit with:
 sbatch run_transcription.sh
 ```
 
+### SLURM training job
+
+For training on the cluster, use `torchrun` inside the SLURM script. Example `run_train.sh`:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=flik-train
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:a100:4
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=120G
+#SBATCH --time=24:00:00
+
+module load cu128  # or your cluster's CUDA module
+
+# CUDA env vars (required for cudnn/cublas)
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true
+export LD_LIBRARY_PATH=$(uv run --extra cu128 python -c "import site; print(site.getsitepackages()[0] + '/nvidia/cudnn/lib')"):$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$(uv run --extra cu128 python -c "import site; print(site.getsitepackages()[0] + '/nvidia/cublas/lib')"):$LD_LIBRARY_PATH
+
+cd "$SLURM_SUBMIT_DIR"
+uv sync --extra cu128
+
+# Build the training manifest (skip if already built)
+# Pure fast path (no CLIP, fastest):
+[[ -f data/expanded_manifest_segments_validated.json ]] || \
+  uv run --extra cu128 python -m scripts.expand_and_validate_manifest
+
+# Hybrid path (video-level CLIP QC — uncomment if desired):
+# uv run --extra cu128 python -m scripts.preprocess  # stages 3-5 → filtered_manifest.json
+# uv run --extra cu128 python -m scripts.expand_and_validate_manifest --input data/filtered_manifest.json
+
+# 4-GPU DDP training
+torchrun --standalone --nnodes=1 --nproc-per-node="$SLURM_GPUS_ON_NODE" \
+  -m scripts.train_hydra
+```
+
+Submit with `sbatch run_train.sh`. Key points for SLURM:
+- The manifest path defaults to `data/expanded_manifest_segments_validated.json` (set in `src/configs/default.yaml`). Override with `dataset.manifest_path=...` if needed.
+- Per-GPU batch size is `dataloader.batch_size=64`; global batch scales with GPU count.
+- Only rank 0 writes checkpoints/logs — no race conditions.
+- For single-GPU training, replace the `torchrun` line with `uv run --extra cu128 python -m scripts.train_hydra`.
+
 ### Multi-GPU (DDP)
 
-Distributed Data Parallel training is **not yet implemented**. For multi-GPU, the recommended path is:
+Distributed Data Parallel training is **implemented** and enabled automatically when launched via `torchrun` (detected via `RANK`/`WORLD_SIZE` env vars). Single-GPU runs (no `torchrun`) are fully backward-compatible — the DDP code paths are gated behind an `is_ddp` flag.
 
-1. Use `torchrun` with `DistributedDataParallel`
-2. All-gather embeddings across GPUs before computing the contrastive loss (so each GPU sees all negatives)
-3. Or use GradCache for memory-efficient large-batch training
+```bash
+# Single-node, 4 GPUs (Snellius A100 ×4)
+torchrun --standalone --nnodes=1 --nproc-per-node=4 -m scripts.train_hydra
+
+# Single-node, 2 GPUs (smoke test)
+torchrun --standalone --nnodes=1 --nproc-per-node=2 -m scripts.train_hydra
+```
+
+**How it works:**
+- Per-GPU batch size stays at `dataloader.batch_size=64`; the **global** effective batch = `64 × world_size` (256 on 4 GPUs). This gives DCL far more negatives per step.
+- Embeddings are all-gathered across GPUs (with gradients, via `torch.distributed.nn.all_gather`) before the contrastive loss, so every GPU sees all `world_size × 64` negatives. Loss is computed locally per-rank to avoid the O(N²) logits memory and gradient-scaling pitfalls of the naive all-gather approach (see OpenCLIP #1144).
+- A `DistributedSampler` shards the dataset across GPUs; `train_sampler.set_epoch(epoch)` is called each epoch.
+- Only rank 0 logs to TensorBoard/WandB/files and saves checkpoints; other ranks log at `WARNING` level to the console.
+- `find_unused_parameters=True` is set on the DDP wrapper (needed because the MLM head is skipped when `mlm_weight=0` and encoders are frozen during warmup).
+- Gradient checkpointing uses `use_reentrant=False` (required when `find_unused_parameters=True`).
+
+**What is NOT yet done** (Phase 2-4):
+- Phase 2: Retrieval eval currently runs on rank 0's data shard only (all-gather eval embeddings not yet implemented) — reported R@K is a lower bound.
+- Phase 3: Encoder unfreeze refactor (start with an `lr=0` param group at epoch 0 instead of `add_param_group` mid-training).
+- Phase 4: Multi-node (`--nnodes>1`) config + SLURM + NCCL env vars. Only single-node multi-GPU is tested.
 
 ## Known limitations
 
-- **No validation split**: Retrieval eval runs on the training set
 - **MLM teacher is broken**: `target_projection` is a frozen random linear — do not enable MLM
 - **No hard negative mining**: FaST-VGS uses top-K=100 hard negatives; not yet implemented
 - **Cross-modal is unidirectional**: Only A→V attention, no V→A or self-attention in cross-modal blocks
 - **VideoMAE vs CLIP**: VideoMAE features are optimized for pixel reconstruction, not semantic alignment. CLIP ViT per-frame may be a stronger starting point for audio-video alignment.
-- **No DDP**: Single-GPU only for now
+- **DDP eval is rank-0 only**: Retrieval eval during DDP training runs on rank 0's data shard, not the full validation set (Phase 2 TODO)
+- **Multi-node not yet supported**: Only single-node multi-GPU (`--nnodes=1`) is tested; multi-node config is Phase 4

@@ -4,18 +4,21 @@ This guide covers the full data pipeline: downloading videos, transcribing audio
 
 ## Pipeline Overview
 
-The pipeline has 6 stages. Stages 1-2 (transcription, manifest building) run individually. Stages 3-6 are orchestrated by `scripts/preprocess.py`.
+The pipeline has 6 stages. Stages 1-2 (transcription, manifest building) run individually. Stages 3-6 are orchestrated by `scripts/preprocess.py`. **For training, the recommended fast path is stages 1-2 → `scripts.expand_and_validate_manifest`** (skips the CLIP filter, see [below](#expand--validate-fast-path--recommended)).
 
 | Stage | Script | Output | GPU? |
 |-------|--------|--------|------|
 | 1 | `src.preprocess.transcribe` | `data/transcripts/*.json` + `.srt` + `_language.txt` | Yes |
 | 2 | `src.preprocess.filter_transcripts` | `data/batch_manifest.json` | No |
+| — | `scripts.expand_and_validate_manifest` | `data/expanded_manifest_segments_validated.json` | No |
 | 3 | `src.preprocess.check_correspondance --mode randomized` | `data/alignment_scores_randomized.json` | Yes |
 | 4 | `src.preprocess.check_correspondance --mode main` | `data/alignment_scores.json` + `_segments.json` | Yes |
 | 5 | `src.preprocess.filter_by_correspondence` | `data/filtered_manifest.json` + `_segments.json` | No |
 | 6 | `scripts.validate_manifest` | `data/filtered_manifest_segments_validated.json` | No |
 
-**Final output for training**: `data/filtered_manifest_segments_validated.json` (segment-level manifest with video-audio pairs that pass CLIP correspondence thresholds AND load-test validation).
+**Final output for training**: `data/expanded_manifest_segments_validated.json` (segment-level manifest with ALL transcript segments that pass the duration filter and load-test validation). This is the **recommended** manifest — built via the [expand + validate fast path](#expand--validate-fast-path--recommended) (optionally with [video-level CLIP QC](#hybrid-workflow-video-level-clip-qc--full-segment-expansion)).
+
+The legacy CLIP-filtered manifest `data/filtered_manifest_segments_validated.json` (stages 3-6) is still available but only keeps ~5 CLIP-scored segments per video. For audio↔video contrastive learning, the CLIP text↔video filter is unnecessary: audio and video come from the same file at the same timestamp, so they are inherently aligned by construction.
 
 ## Prerequisites
 
@@ -68,6 +71,66 @@ uv run --extra cu128 python -m src.preprocess.filter_transcripts
 ```
 
 **Output**: `data/batch_manifest.json` — list of `{id, video_path, json_path}` entries.
+
+## Expand + validate (fast path) — RECOMMENDED
+
+After stages 1-2, instead of running the CLIP correspondence pipeline (stages 3-6), use the expand+validate script. This expands ALL transcript segments (with the 3-10s duration filter) and load-test-validates them, producing a much larger training manifest.
+
+```bash
+uv run --extra cu128 python -m scripts.expand_and_validate_manifest
+```
+
+**Output**: `data/expanded_manifest_segments_validated.json` — the default training manifest.
+
+Options:
+```bash
+uv run --extra cu128 python -m scripts.expand_and_validate_manifest \
+  --input data/batch_manifest.json \
+  --output data/expanded_manifest_segments_validated.json \
+  --min-duration 3.0 \
+  --max-duration 10.0 \
+  --num-workers 16 \
+  --skip-validate          # skip decode validation (faster, for testing)
+```
+
+**Why this exists**: The CLIP correspondence filter (stages 3-5) scores only ~5 segments per video against text, then filters by percentile. This is designed for text↔video alignment. But the contrastive task is audio↔video alignment — audio and video are sampled from the same file at the same timestamp, so they are inherently aligned and the text filter is irrelevant. The expand+validate path keeps every segment that loads cleanly, yielding a far larger training set.
+
+| Step | Script | Output | GPU? |
+|------|--------|--------|------|
+| Expand + validate | `scripts.expand_and_validate_manifest` | `data/expanded_manifest_segments_validated.json` | No |
+
+A failure log is written to `data/expanded_manifest_segments_validated_failures.txt`.
+
+### Hybrid workflow (video-level CLIP QC + full segment expansion)
+
+The pure fast path above skips CLIP entirely. If you want to **filter out whole videos** where the transcript doesn't match the visual content (wrong language, hallucinated speech over silent films, mismatched audio tracks), run the CLIP video-level filter first, then expand all segments from the passing videos only:
+
+```bash
+# 1. Video-level CLIP QC (stages 3-5, GPU required)
+#    Samples ~5 segments/video, scores text↔frame correspondence,
+#    removes whole videos below the percentile threshold.
+uv run --extra cu128 python -m scripts.preprocess
+# → data/filtered_manifest.json (video-level allowlist of passing videos)
+
+# 2. Expand ALL transcript segments from passing videos + validate
+#    (NOT just the ~5 CLIP-scored segments — all of them)
+uv run --extra cu128 python -m scripts.expand_and_validate_manifest \
+  --input data/filtered_manifest.json \
+  --output data/expanded_manifest_segments_validated.json
+```
+
+**What this preserves vs. what it drops:**
+- ✅ **Keeps**: video-level QC — bad videos (desynced audio, wrong-language transcripts, unrelated voiceovers) are removed.
+- ✅ **Keeps**: all transcript segments (3-10s) from passing videos — not just the ~5 that CLIP scored.
+- ❌ **Drops**: segment-level CLIP filtering. This is intentional — the CLIP filter measures text↔video frame alignment, but the contrastive task is audio↔video alignment (same file, same timestamp, inherently aligned). Text isn't used in the loss.
+
+**Tradeoff**: requires running stages 3-4 (GPU). The pure fast path (input = `batch_manifest.json`) skips the GPU cost entirely but has no video-level QC.
+
+| Path | Input | Video QC? | Segment count | GPU needed? |
+|------|-------|-----------|---------------|-------------|
+| Pure fast path | `batch_manifest.json` | None | All segments (duration+load-test filtered) | No |
+| Hybrid | `filtered_manifest.json` (stages 3-5) | CLIP video-level | All segments from passing videos | Yes (stages 3-4) |
+| Legacy (stages 3-6) | `filtered_manifest_segments.json` | CLIP video+segment | ~5 CLIP-scored segments/video | Yes (stages 3-4) |
 
 ## Stages 3-6: Correspondence scoring, filtering, and validation
 
