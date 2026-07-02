@@ -331,21 +331,13 @@ SLURM job scripts: `run_transcription.sh`, `run_correpond.sh`. Submit with:
 sbatch run_transcription.sh
 ```
 
-### SLURM training job
+### SLURM Job Script
 
-For training on the cluster, use `torchrun` inside the SLURM script. Example `run_train.sh`:
+SLURM job scripts are not tracked in the repo (they live on the cluster).
+Paste this block into your own `#SBATCH` script, after the directives and
+`module load` lines:
 
 ```bash
-#!/bin/bash
-#SBATCH --job-name=flik-train
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:a100:4
-#SBATCH --cpus-per-task=18
-#SBATCH --mem=120G
-#SBATCH --time=24:00:00
-
-module load cu128  # or your cluster's CUDA module
-
 # CUDA env vars (required for cudnn/cublas)
 export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true
 export LD_LIBRARY_PATH=$(uv run --extra cu128 python -c "import site; print(site.getsitepackages()[0] + '/nvidia/cudnn/lib')"):$LD_LIBRARY_PATH
@@ -354,25 +346,27 @@ export LD_LIBRARY_PATH=$(uv run --extra cu128 python -c "import site; print(site
 cd "$SLURM_SUBMIT_DIR"
 uv sync --extra cu128
 
-# Build the training manifest (skip if already built)
-# Pure fast path (no CLIP, fastest):
+# Build manifest if not present
 [[ -f data/expanded_manifest_segments.json ]] || \
   uv run --extra cu128 python -m scripts.expand_and_validate_manifest
 
-# Hybrid path (video-level CLIP QC — uncomment if desired):
-# uv run --extra cu128 python -m scripts.preprocess  # stages 3-5 → filtered_manifest.json
-# uv run --extra cu128 python -m scripts.expand_and_validate_manifest --input data/filtered_manifest.json
-
-# 4-GPU DDP training
+# --- Single-node (default) ---
 torchrun --standalone --nnodes=1 --nproc-per-node="$SLURM_GPUS_ON_NODE" \
-  -m scripts.train_hydra
+  -m scripts.train_hydra "$@"
+
+# --- Multi-node (2+ nodes): comment out single-node above, uncomment below ---
+# SLURM does NOT set MASTER_ADDR/MASTER_PORT — you must set them manually.
+# export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+# export MASTER_PORT=29500
+# srun torchrun \
+#   --nnodes=$SLURM_JOB_NUM_NODES \
+#   --nproc-per-node=$SLURM_GPUS_PER_NODE \
+#   --rdzv-backend=c10d \
+#   --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT \
+#   -m scripts.train_hydra "$@"
 ```
 
-Submit with `sbatch run_train.sh`. Key points for SLURM:
-- The manifest path defaults to `data/expanded_manifest_segments.json` (set in `src/configs/default.yaml`). Override with `dataset.manifest_path=...` if needed.
-- Per-GPU batch size is `dataloader.batch_size=64`; global batch scales with GPU count.
-- Only rank 0 writes checkpoints/logs — no race conditions.
-- For single-GPU training, replace the `torchrun` line with `uv run --extra cu128 python -m scripts.train_hydra`.
+Pass config overrides as args: `sbatch myjob.sh training.resume_from=logdir/run1/checkpoint_latest.pth`
 
 ### Multi-GPU (DDP)
 
@@ -394,10 +388,60 @@ torchrun --standalone --nnodes=1 --nproc-per-node=2 -m scripts.train_hydra
 - `find_unused_parameters=True` is set on the DDP wrapper (needed because the MLM head is skipped when `mlm_weight=0` and encoders are frozen during warmup).
 - Gradient checkpointing uses `use_reentrant=False` (required when `find_unused_parameters=True`).
 
-**What is NOT yet done** (Phase 2-4):
-- Phase 2: Retrieval eval currently runs on rank 0's data shard only (all-gather eval embeddings not yet implemented) — reported R@K is a lower bound.
-- Phase 3: Encoder unfreeze refactor (start with an `lr=0` param group at epoch 0 instead of `add_param_group` mid-training).
-- Phase 4: Multi-node (`--nnodes>1`) config + SLURM + NCCL env vars. Only single-node multi-GPU is tested.
+**Distributed eval:** All ranks process their val shard via `DistributedSampler`, then embeddings are all-gathered so rank 0 computes R@K on the full validation set.
+
+**Encoder warmup:** Encoder params start with `lr=0` (not `requires_grad=False`) so DDP's reducer tracks them from epoch 0. At the unfreeze epoch, the group LR is set to `encoder_lr` — no `add_param_group` mid-training.
+
+**Multi-node (2+ nodes):**
+```bash
+# SLURM does NOT set MASTER_ADDR/MASTER_PORT — set them manually:
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=29500
+
+srun torchrun \
+  --nnodes=$SLURM_JOB_NUM_NODES \
+  --nproc-per-node=$SLURM_GPUS_PER_NODE \
+  --rdzv-backend=c10d \
+  --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT \
+  -m scripts.train_hydra
+```
+The NCCL init timeout defaults to 30 minutes (`hardware.ddp_timeout_min`); increase it for slow interconnects.
+
+### Checkpoint Resume
+
+Training saves three types of checkpoint:
+
+| File | When | Purpose |
+|------|------|---------|
+| `checkpoint_latest.pth` | Every epoch + every `checkpoint_frequency` steps | Resume after crash |
+| `checkpoint_best.pth` | New best `mean_r1` | Resume + inference |
+| `checkpoint_epoch{N}.pth` | End of training | Final artifact |
+
+All checkpoints include full state: model, optimizer, scheduler, AMP scaler,
+RNG states, best metric, and config.
+
+**Resume from a checkpoint:**
+```bash
+# Single-GPU
+uv run --extra cu128 python -m scripts.train_hydra \
+  training.resume_from=logdir/run1/checkpoint_latest.pth
+
+# Multi-GPU
+torchrun --standalone --nnodes=1 --nproc-per-node=4 \
+  -m scripts.train_hydra \
+  training.resume_from=logdir/run1/checkpoint_latest.pth
+
+# Via SLURM (pass as args to your sbatch script)
+sbatch myjob.sh training.resume_from=logdir/run1/checkpoint_latest.pth
+```
+
+On resume:
+- All ranks load the checkpoint from the shared filesystem (GPFS).
+- Optimizer, scheduler, and AMP scaler states are restored.
+- RNG states (Python, PyTorch, NumPy, CUDA) are restored for reproducibility.
+- If resuming past the encoder warmup phase, the encoder LR is automatically
+  set to `encoder_lr` (no manual intervention needed).
+- Training continues from `checkpoint_epoch + 1` to `num_epochs`.
 
 ## Known limitations
 
@@ -405,5 +449,3 @@ torchrun --standalone --nnodes=1 --nproc-per-node=2 -m scripts.train_hydra
 - **No hard negative mining**: FaST-VGS uses top-K=100 hard negatives; not yet implemented
 - **Cross-modal is unidirectional**: Only A→V attention, no V→A or self-attention in cross-modal blocks
 - **VideoMAE vs CLIP**: VideoMAE features are optimized for pixel reconstruction, not semantic alignment. CLIP ViT per-frame may be a stronger starting point for audio-video alignment.
-- **DDP eval is rank-0 only**: Retrieval eval during DDP training runs on rank 0's data shard, not the full validation set (Phase 2 TODO)
-- **Multi-node not yet supported**: Only single-node multi-GPU (`--nnodes=1`) is tested; multi-node config is Phase 4

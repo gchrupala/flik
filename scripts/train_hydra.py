@@ -80,14 +80,16 @@ def _setup_distributed(timeout_min: int = 30):
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     if world_size <= 1 and not os.environ.get("RANK"):
         return 0, 1, 0, False
+    # Set device BEFORE init_process_group so NCCL binds to the correct GPU.
+    # (Not using device_id= arg: NCCL's duplicate-GPU check flags same bus ID
+    # across nodes in multi-node — see NCCLUtils.cpp "Duplicate GPU detected".)
+    torch.cuda.set_device(local_rank)
     dist.init_process_group(
         backend="nccl",
         rank=rank,
         world_size=world_size,
         timeout=timedelta(minutes=timeout_min),
-        device_id=local_rank,
     )
-    torch.cuda.set_device(local_rank)
     return rank, world_size, local_rank, True
 
 
