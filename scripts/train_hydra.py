@@ -31,6 +31,14 @@ os.environ["HF_HOME"] = os.path.join(os.path.dirname(__file__), "..", "cache")
 # lets an externally-exported value win.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# Restrict each DDP process to its assigned GPU. Without this, all processes
+# on a node see ALL GPUs, and NCCL 2.27+ flags same-bus-ID GPUs on different
+# nodes as duplicates (e.g. GPU 0 on node 0 and GPU 0 on node 1 both have bus
+# ID 31000). Must be set before any CUDA call. With this set, each process
+# sees one GPU remapped to index 0.
+if "LOCAL_RANK" in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -83,7 +91,8 @@ def _setup_distributed(timeout_min: int = 30):
     # Set device BEFORE init_process_group so NCCL binds to the correct GPU.
     # (Not using device_id= arg: NCCL's duplicate-GPU check flags same bus ID
     # across nodes in multi-node — see NCCLUtils.cpp "Duplicate GPU detected".)
-    torch.cuda.set_device(local_rank)
+    # With CUDA_VISIBLE_DEVICES set, each process sees one GPU at index 0.
+    torch.cuda.set_device(0)
     dist.init_process_group(
         backend="nccl",
         rank=rank,
@@ -556,7 +565,7 @@ def main(cfg: DictConfig):
 
     # Device
     if is_ddp:
-        device = torch.device(f"cuda:{local_rank}")
+        device = torch.device("cuda:0")  # CUDA_VISIBLE_DEVICES remaps to index 0
     elif cfg.hardware.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -705,7 +714,10 @@ def main(cfg: DictConfig):
             model.dual_encoder.video_encoder.videomae.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
-            model.enable_input_require_grads()
+            # enable_input_require_grads is a HF PreTrainedModel method; call on
+            # the underlying HF models, not on FlikModel (a plain nn.Module wrapper).
+            model.dual_encoder.audio_encoder.wav2vec2.enable_input_require_grads()
+            model.dual_encoder.video_encoder.videomae.enable_input_require_grads()
             logger.info("Gradient checkpointing enabled on wav2vec2 + videomae (use_reentrant=False)")
         except Exception as e:
             logger.warning(f"Failed to enable gradient checkpointing: {e}")
@@ -724,7 +736,7 @@ def main(cfg: DictConfig):
     if is_ddp:
         model = DDP(
             model,
-            device_ids=[local_rank],
+            device_ids=[0],  # CUDA_VISIBLE_DEVICES remaps to index 0
             find_unused_parameters=True,
             gradient_as_bucket_view=True,
         )
