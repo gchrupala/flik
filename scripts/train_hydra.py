@@ -17,6 +17,9 @@ import os
 import math
 import json
 import random
+from datetime import timedelta
+
+import numpy as np
 
 # Set HuggingFace cache to a local directory to avoid permission issues
 os.environ["TRANSFORMERS_CACHE"] = os.path.join(
@@ -59,11 +62,15 @@ def _is_encoder_param(name: str) -> bool:
     return "wav2vec2" in name or "videomae" in name
 
 
-def _setup_distributed():
+def _setup_distributed(timeout_min: int = 30):
     """Initialize the DDP process group from torchrun env vars.
 
     Returns (rank, world_size, local_rank, is_ddp). No-op (returns 0,1,0,False)
     when not launched under torchrun / when CUDA is unavailable.
+
+    Multi-node: torchrun --nnodes=N --rdzv-backend=c10d sets all required env
+    vars (MASTER_ADDR, MASTER_PORT, RANK, WORLD_SIZE, LOCAL_RANK). No code
+    changes needed — just launch with the right torchrun flags.
     """
     if not (dist.is_available() and torch.cuda.is_available()):
         return 0, 1, 0, False
@@ -73,7 +80,13 @@ def _setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     if world_size <= 1 and not os.environ.get("RANK"):
         return 0, 1, 0, False
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(minutes=timeout_min),
+        device_id=local_rank,
+    )
     torch.cuda.set_device(local_rank)
     return rank, world_size, local_rank, True
 
@@ -102,6 +115,101 @@ def build_param_groups(model: nn.Module, lr: float, encoder_lr: float, weight_de
         )
 
     return param_groups, len(new_params), len(encoder_params)
+
+
+def _save_checkpoint(
+    path, model, optimizer, scheduler, scaler,
+    epoch, global_step, best_metric, best_epoch, select_metric,
+    cfg, is_ddp,
+):
+    """Save full training state for resume.
+
+    Includes model, optimizer, scheduler, AMP scaler, RNG states, best metric,
+    and config. All three checkpoint types (latest, best, final) use this format.
+    """
+    model_to_save = model.module if is_ddp else model
+    checkpoint = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state_dict": model_to_save.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+        "best_metric": best_metric,
+        "best_epoch": best_epoch,
+        "select_metric": select_metric,
+        "config": OmegaConf.to_container(cfg, resolve=True),
+        "rng_states": {
+            "python": random.getstate(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy": np.random.get_state(),
+        },
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(checkpoint, path)
+
+
+def _load_checkpoint(
+    path, model, optimizer, scheduler, scaler,
+    is_ddp, logger,
+):
+    """Load checkpoint and restore all state.
+
+    Returns (start_epoch, global_step, best_metric, best_epoch).
+    All ranks load from shared filesystem (standard for HPC with GPFS).
+    """
+    logger.info(f"Resuming from {path}")
+    # weights_only=False: checkpoint contains config dict, RNG states, optimizer
+    # state — not just tensors.
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+
+    # Load model state (strip module. prefix if checkpoint was saved from DDP)
+    model_to_load = model.module if is_ddp else model
+    state_dict = checkpoint["model_state_dict"]
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_key = k[7:] if k.startswith("module.") else k
+        new_state_dict[new_key] = v
+    model_to_load.load_state_dict(new_state_dict)
+    logger.info("  Restored model state")
+
+    if "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        logger.info("  Restored optimizer state")
+    else:
+        logger.warning("  No optimizer state in checkpoint — starting fresh")
+
+    if "scheduler_state_dict" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        logger.info("  Restored scheduler state")
+
+    if scaler is not None and checkpoint.get("scaler_state_dict") is not None:
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        logger.info("  Restored AMP scaler state")
+
+    if "rng_states" in checkpoint:
+        rng = checkpoint["rng_states"]
+        if rng.get("python") is not None:
+            random.setstate(rng["python"])
+        if rng.get("torch") is not None:
+            torch.set_rng_state(rng["torch"])
+        if rng.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng["cuda"])
+        if rng.get("numpy") is not None:
+            np.random.set_state(rng["numpy"])
+        logger.info("  Restored RNG states")
+
+    start_epoch = checkpoint["epoch"] + 1
+    global_step = checkpoint["global_step"]
+    best_metric = checkpoint.get("best_metric", float("-inf"))
+    best_epoch = checkpoint.get("best_epoch", -1)
+
+    logger.info(
+        f"  Resumed at epoch {start_epoch}, global_step {global_step}, "
+        f"best_metric={best_metric:.4f} @ epoch {best_epoch}"
+    )
+    return start_epoch, global_step, best_metric, best_epoch
 
 
 def cosine_with_warmup_lambda(step: int, warmup_steps: int, total_steps: int) -> float:
@@ -187,6 +295,10 @@ def train_one_epoch(
     tb_writer=None,
     wandb_run=None,
     is_ddp=False,
+    rank=0,
+    best_metric=float("-inf"),
+    best_epoch=-1,
+    select_metric="mean_r1",
 ):
     model.train()
     total_loss = 0.0
@@ -320,6 +432,22 @@ def train_one_epoch(
 
         global_step += 1
 
+        # Periodic checkpoint (every checkpoint_frequency steps).
+        # Saves full state for crash recovery. Rank 0 writes, then barrier
+        # ensures all ranks wait before proceeding.
+        checkpoint_frequency = cfg.training.get("checkpoint_frequency", 0)
+        if checkpoint_frequency > 0 and global_step % checkpoint_frequency == 0:
+            if not is_ddp or rank == 0:
+                latest_path = os.path.join(cfg.training.checkpoint_dir, "checkpoint_latest.pth")
+                _save_checkpoint(
+                    latest_path, model, optimizer, scheduler, scaler,
+                    epoch, global_step, best_metric, best_epoch, select_metric,
+                    cfg, is_ddp,
+                )
+                logger.info(f"Periodic checkpoint saved at step {global_step}")
+            if is_ddp:
+                dist.barrier()
+
     # Compute epoch averages
     avg_loss = total_loss / num_steps if num_steps > 0 else 0.0
     avg_contrastive_loss = total_contrastive_loss / num_steps if num_steps > 0 else 0.0
@@ -413,7 +541,8 @@ def main(cfg: DictConfig):
     log_dir = os.path.abspath(os.path.join(get_original_cwd(), cfg.logging.log_dir))
 
     # DDP init (no-op on single GPU / CPU). Must happen before any CUDA context.
-    rank, world_size, local_rank, is_ddp = _setup_distributed()
+    ddp_timeout_min = cfg.hardware.get("ddp_timeout_min", 30)
+    rank, world_size, local_rank, is_ddp = _setup_distributed(timeout_min=ddp_timeout_min)
 
     loggers = setup_logging(cfg, log_dir, rank=rank)
     logger = loggers["logger"]
@@ -684,11 +813,34 @@ def main(cfg: DictConfig):
     else:
         logger.info("Mixed precision disabled (CPU or config flag off)")
 
-    # Training loop
+    # Resume from checkpoint (all ranks load from shared filesystem).
+    # Restores model, optimizer, scheduler, scaler, RNG states, best metric.
+    # If resuming past encoder warmup, encoder LR is set to encoder_lr automatically.
+    start_epoch = 1
     global_step = 0
     best_metric = float("-inf")
     best_epoch = -1
-    for epoch in range(1, cfg.training.num_epochs + 1):
+    select_metric = cfg.validation.get("select_metric", "mean_r1")
+    resume_from = cfg.training.get("resume_from", None)
+    if resume_from:
+        start_epoch, global_step, best_metric, best_epoch = _load_checkpoint(
+            resume_from, model, optimizer, scheduler, scaler, is_ddp, logger,
+        )
+        # If resuming past encoder warmup, set encoder LR to encoder_lr.
+        # Param groups were built with lr=0 for warmup; need to unfreeze.
+        if freeze_encoder_epochs > 0 and start_epoch > freeze_encoder_epochs:
+            for group in optimizer.param_groups:
+                if group.get("name") == "encoder":
+                    group["lr"] = encoder_lr
+                    break
+            logger.info(
+                f"Resumed past encoder warmup (start_epoch={start_epoch} > "
+                f"freeze_encoder_epochs={freeze_encoder_epochs}). "
+                f"Encoder param group lr set to {encoder_lr}."
+            )
+
+    # Training loop
+    for epoch in range(start_epoch, cfg.training.num_epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -723,6 +875,10 @@ def main(cfg: DictConfig):
             tb_writer=tb_writer,
             wandb_run=wandb_run,
             is_ddp=is_ddp,
+            rank=rank,
+            best_metric=best_metric,
+            best_epoch=best_epoch,
+            select_metric=select_metric,
         )
 
         if cfg.training.run_retrieval_eval and val_dataloader is not None:
@@ -748,44 +904,40 @@ def main(cfg: DictConfig):
                     best_epoch = epoch
                     if not is_ddp or rank == 0:
                         best_path = os.path.join(cfg.training.checkpoint_dir, "checkpoint_best.pth")
-                        os.makedirs(cfg.training.checkpoint_dir, exist_ok=True)
-                        model_to_save = model.module if is_ddp else model
-                        torch.save(
-                            {
-                                "epoch": epoch,
-                                "global_step": global_step,
-                                "model_state_dict": model_to_save.state_dict(),
-                                "best_metric": best_metric,
-                                "select_metric": sel,
-                                "config": OmegaConf.to_container(cfg, resolve=True),
-                            },
-                            best_path,
+                        _save_checkpoint(
+                            best_path, model, optimizer, scheduler, scaler,
+                            epoch, global_step, best_metric, best_epoch, sel,
+                            cfg, is_ddp,
                         )
                         logger.info(f"New best {sel}={best_metric:.4f} @ epoch {epoch} — saved {best_path}")
+
+        # Save latest checkpoint (every epoch, rank 0 only under DDP).
+        # Full state for crash recovery. Barrier ensures all ranks wait for save.
+        if not is_ddp or rank == 0:
+            latest_path = os.path.join(cfg.training.checkpoint_dir, "checkpoint_latest.pth")
+            _save_checkpoint(
+                latest_path, model, optimizer, scheduler, scaler,
+                epoch, global_step, best_metric, best_epoch, select_metric,
+                cfg, is_ddp,
+            )
+            logger.info(f"Latest checkpoint saved to {latest_path}")
+        if is_ddp:
+            dist.barrier()
 
     logger.info(f"Best val {cfg.validation.get('select_metric', 'mean_r1')}={best_metric:.4f} at epoch {best_epoch}")
     logger.info("Training finished")
 
-    # Save checkpoint (rank 0 only under DDP). Use model.module.state_dict()
-    # when DDP-wrapped so checkpoint keys match a plain (non-DDP) model.
+    # Save final checkpoint (rank 0 only under DDP). Full state for resume/inference.
     if not is_ddp or rank == 0:
-        checkpoint_path = os.path.join(
+        final_path = os.path.join(
             cfg.training.checkpoint_dir, f"checkpoint_epoch{cfg.training.num_epochs}.pth"
         )
-        os.makedirs(cfg.training.checkpoint_dir, exist_ok=True)
-        model_to_save = model.module if is_ddp else model
-        torch.save(
-            {
-                "epoch": cfg.training.num_epochs,
-                "global_step": global_step,
-                "model_state_dict": model_to_save.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "config": OmegaConf.to_container(cfg, resolve=True),
-            },
-            checkpoint_path,
+        _save_checkpoint(
+            final_path, model, optimizer, scheduler, scaler,
+            cfg.training.num_epochs, global_step, best_metric, best_epoch, select_metric,
+            cfg, is_ddp,
         )
-        logger.info(f"Checkpoint saved to {checkpoint_path}")
+        logger.info(f"Final checkpoint saved to {final_path}")
 
     # Sync all ranks before tearing down the process group so the save
     # completes on rank 0 before any rank exits.

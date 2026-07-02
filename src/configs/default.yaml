@@ -53,6 +53,7 @@ training:
   eval_frequency: 500  # steps
   log_frequency: 10  # steps
   run_retrieval_eval: true
+  resume_from: null          # path to checkpoint .pth to resume from (null = fresh start)
 
 # Optimizer
 optimizer:
@@ -93,6 +94,7 @@ logging:
 # Hardware
 hardware:
   device: "cuda"
+  ddp_timeout_min: 30        # NCCL init timeout in minutes (multi-node may need longer)
 
 # Validation (retrieval metrics)
 validation:
