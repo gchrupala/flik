@@ -5,7 +5,7 @@ Commit and run with: uv run --extra cu128 python -m scripts.debug_data
 """
 import sys, os
 
-os.environ["TRANSFORMERS_CACHE"] = os.path.join(os.path.dirname(__file__), "..", "cache")
+# Set HuggingFace cache to a local directory to avoid permission issues
 os.environ["HF_HOME"] = os.path.join(os.path.dirname(__file__), "..", "cache")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

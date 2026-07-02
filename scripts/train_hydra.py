@@ -22,9 +22,6 @@ from datetime import timedelta
 import numpy as np
 
 # Set HuggingFace cache to a local directory to avoid permission issues
-os.environ["TRANSFORMERS_CACHE"] = os.path.join(
-    os.path.dirname(__file__), "..", "cache"
-)
 os.environ["HF_HOME"] = os.path.join(os.path.dirname(__file__), "..", "cache")
 # Reduce CUDA memory fragmentation over long training runs (prevents the
 # "reserved but unallocated" OOM that appears after many epochs). setdefault
@@ -703,9 +700,7 @@ def main(cfg: DictConfig):
 
     # Gradient checkpointing (saves memory at the cost of recomputation).
     # CRITICAL under DDP: use_reentrant=False is required for DDP's autograd
-    # graph analysis to work with find_unused_parameters=True. Also call
-    # enable_input_require_grads() so the checkpointed submodules' inputs
-    # require grad (otherwise DDP silently skips their gradients).
+    # graph analysis to work with find_unused_parameters=True.
     if cfg.training.get("gradient_checkpointing", False) and device.type == "cuda":
         try:
             model.dual_encoder.audio_encoder.wav2vec2.gradient_checkpointing_enable(
@@ -714,13 +709,21 @@ def main(cfg: DictConfig):
             model.dual_encoder.video_encoder.videomae.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
-            # enable_input_require_grads is a HF PreTrainedModel method; call on
-            # the underlying HF models, not on FlikModel (a plain nn.Module wrapper).
-            model.dual_encoder.audio_encoder.wav2vec2.enable_input_require_grads()
-            model.dual_encoder.video_encoder.videomae.enable_input_require_grads()
             logger.info("Gradient checkpointing enabled on wav2vec2 + videomae (use_reentrant=False)")
         except Exception as e:
-            logger.warning(f"Failed to enable gradient checkpointing: {e}")
+            logger.warning(f"Failed to enable gradient checkpointing on encoders: {e}")
+
+        # enable_input_require_grads() registers a hook so checkpointed
+        # submodules' inputs require grad. Only needed for NLP models where
+        # input is token IDs → embedding lookup (no grad through the lookup).
+        # For audio (float waveform) and video (float frames), inputs already
+        # require grad. Wav2Vec2Model doesn't implement get_input_embeddings(),
+        # so this call raises — wrap in try/except.
+        try:
+            model.dual_encoder.audio_encoder.wav2vec2.enable_input_require_grads()
+            model.dual_encoder.video_encoder.videomae.enable_input_require_grads()
+        except Exception:
+            pass  # Not needed for audio/video — inputs are float tensors
 
     # Encoder warmup: encoder params use lr=0 for first N epochs,
     # then their param group LR is set to encoder_lr. This keeps all params

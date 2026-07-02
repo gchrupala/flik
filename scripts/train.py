@@ -7,9 +7,6 @@ import sys
 import os
 
 # Set HuggingFace cache to a local directory to avoid permission issues
-os.environ["TRANSFORMERS_CACHE"] = os.path.join(
-    os.path.dirname(__file__), "..", "cache"
-)
 os.environ["HF_HOME"] = os.path.join(os.path.dirname(__file__), "..", "cache")
 
 import logging
