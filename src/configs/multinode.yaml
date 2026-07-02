@@ -3,6 +3,15 @@
 # Launch with:  uv run --extra cu128 python -m scripts.train_hydra --config-name=multinode
 #
 # Rationale for overrides:
+#   - batch_size 64 -> 128:       Doubles per-GPU batch. More negatives per DCL step.
+#                                  Monitor GPU memory — if OOM, drop to 96.
+#   - num_workers 12 -> 8:        CPU was at ~30% with 48 workers (4×12). Reducing to
+#                                  32 workers (4×8) saves ~32 GB RAM with negligible
+#                                  throughput impact (data_time_avg was ~0.06s vs
+#                                  ~10s forward — prefetch massively over-provisioned).
+#   - prefetch_factor 4 -> 2:     Queue depth was 4×12=48 batches (~300s buffer) vs
+#                                  ~10s/step needed. Halving saves ~75 GB pinned RAM.
+#                                  Queue still 2×8=16 batches (~100s buffer) — plenty.
 #   - log_frequency 10 -> 50:     Multi-node has fewer steps/epoch (data split across
 #                                  ranks), so 10-step logging is too verbose. 50 gives
 #                                  ~7 logs/epoch on 8-GPU vs ~35 at the default.
@@ -12,6 +21,10 @@
 #                                  faster now (AMP + batch 64, see eval_batch_size).
 #   - eval_batch_size 16 -> 64:   Eval is forward-only + no_grad + AMP, so a much larger
 #                                  batch is safe and ~4x faster than the training batch.
+#   - use_wandb false -> true:    Enable WandB logging by default for multinode runs.
+#
+# Net CPU memory impact: ~90 GB freed (330 -> ~240 GB) from fewer workers + shallower
+# prefetch, partially offset by larger batches (~+18 GB for batch 128 vs 64).
 #
 # NOTE: LR (1e-3), encoder_lr (5e-6), warmup_steps (500), and num_epochs (50) are
 # intentionally NOT overridden. AdamW is relatively batch-size-insensitive (adaptive
@@ -23,9 +36,17 @@ defaults:
   - default
   - _self_
 
+dataloader:
+  batch_size: 128
+  num_workers: 8
+  prefetch_factor: 2
+
 training:
   log_frequency: 50
   eval_every_n_epochs: 5
+
+logging:
+  use_wandb: true
 
 validation:
   eval_batch_size: 64
