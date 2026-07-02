@@ -50,7 +50,7 @@ training:
   freeze_encoder_epochs: 5  # freeze pretrained encoders for first N epochs (projection head warmup)
   checkpoint_dir: "checkpoints"
   checkpoint_frequency: 1000  # steps
-  eval_frequency: 500  # steps
+  eval_every_n_epochs: 1  # run retrieval eval every N epochs (always on last epoch); 1 = every epoch
   log_frequency: 10  # steps
   run_retrieval_eval: true
   resume_from: null          # path to checkpoint .pth to resume from (null = fresh start)

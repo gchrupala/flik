@@ -107,7 +107,10 @@ All configuration is in `src/configs/default.yaml`. Key sections:
 | `gradient_checkpointing` | true | Trade compute for memory on wav2vec2 + videomae |
 | `freeze_encoder_epochs` | 5 | Freeze pretrained encoders for first N epochs (projection head warmup) |
 | `log_frequency` | 10 | Log every N steps |
-| `run_retrieval_eval` | true | Run retrieval evaluation after each epoch |
+| `eval_every_n_epochs` | 1 | Run retrieval eval every N epochs (always on last epoch; 1 = every epoch) |
+| `run_retrieval_eval` | true | Enable retrieval evaluation (frequency controlled by `eval_every_n_epochs`) |
+
+> **Multi-node config**: Use `--config-name=multinode` for 4+ GPU DDP runs. It inherits `default.yaml` and raises `log_frequency` to 50, `eval_every_n_epochs` to 5, and `eval_batch_size` to 64 — less verbose logging and fewer/cheaper evals suited to the shorter per-rank epochs and larger global batch.
 
 ### Optimizer (`optimizer.*`)
 
@@ -255,7 +258,7 @@ tensorboard --logdir logdir
 # Or in WandB (set logging.use_wandb=true)
 ```
 
-> **Validation split**: A fraction of videos (`validation.split_ratio=0.1`, default) is held out from training and used for retrieval evaluation after each epoch. The split is grouped by `video_id` (deterministic, seeded by `validation.split_seed=42`) so no film appears in both train and validation — preventing leakage. Metrics are logged as `val/a2v_r@1`, `val/v2a_r@1`, `val/mean_r1`, etc. Set `validation.split_ratio=0` to disable and eval on the training set.
+> **Validation split**: A fraction of videos (`validation.split_ratio=0.1`, default) is held out from training and used for retrieval evaluation every `training.eval_every_n_epochs` epochs (default 1 = every epoch; 5 in `multinode.yaml`; always on the last epoch). Eval runs in AMP with `validation.eval_batch_size` (16 default; 64 in multinode) since it is forward-only with `no_grad` — embeddings are cast to FP32 before ranking for precision. The split is grouped by `video_id` (deterministic, seeded by `validation.split_seed=42`) so no film appears in both train and validation — preventing leakage. Metrics are logged as `val/a2v_r@1`, `val/v2a_r@1`, `val/mean_r1`, etc. Set `validation.split_ratio=0` to disable and eval on the training set.
 
 ## Model architecture
 
@@ -374,11 +377,15 @@ Distributed Data Parallel training is **implemented** and enabled automatically 
 
 ```bash
 # Single-node, 4 GPUs (Snellius A100 ×4)
-torchrun --standalone --nnodes=1 --nproc-per-node=4 -m scripts.train_hydra
+torchrun --standalone --nnodes=1 --nproc-per-node=4 \
+  -m scripts.train_hydra --config-name=multinode
 
 # Single-node, 2 GPUs (smoke test)
-torchrun --standalone --nnodes=1 --nproc-per-node=2 -m scripts.train_hydra
+torchrun --standalone --nnodes=1 --nproc-per-node=2 \
+  -m scripts.train_hydra --config-name=multinode
 ```
+
+`--config-name=multinode` loads `src/configs/multinode.yaml` (inherits `default.yaml`, then raises `log_frequency` to 50, `eval_every_n_epochs` to 5, `eval_batch_size` to 64). Use `default` (or omit `--config-name`) for single-GPU runs.
 
 **How it works:**
 - Per-GPU batch size stays at `dataloader.batch_size=64`; the **global** effective batch = `64 × world_size` (256 on 4 GPUs). This gives DCL far more negatives per step.
@@ -403,7 +410,7 @@ srun torchrun \
   --nproc-per-node=$SLURM_GPUS_PER_NODE \
   --rdzv-backend=c10d \
   --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT \
-  -m scripts.train_hydra
+  -m scripts.train_hydra --config-name=multinode
 ```
 The NCCL init timeout defaults to 30 minutes (`hardware.ddp_timeout_min`); increase it for slow interconnects.
 
@@ -428,7 +435,7 @@ uv run --extra cu128 python -m scripts.train_hydra \
 
 # Multi-GPU
 torchrun --standalone --nnodes=1 --nproc-per-node=4 \
-  -m scripts.train_hydra \
+  -m scripts.train_hydra --config-name=multinode \
   training.resume_from=logdir/run1/checkpoint_latest.pth
 
 # Via SLURM (pass as args to your sbatch script)

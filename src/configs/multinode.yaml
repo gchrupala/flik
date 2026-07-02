@@ -1,0 +1,31 @@
+# Multi-node DDP configuration (inherits from default, overrides for 4+ GPUs).
+#
+# Launch with:  uv run --extra cu128 python -m scripts.train_hydra --config-name=multinode
+#
+# Rationale for overrides:
+#   - log_frequency 10 -> 50:     Multi-node has fewer steps/epoch (data split across
+#                                  ranks), so 10-step logging is too verbose. 50 gives
+#                                  ~7 logs/epoch on 8-GPU vs ~35 at the default.
+#   - eval_every_n_epochs 1 -> 5: Eval on ~19k val segments is expensive. Running it
+#                                  every 5 epochs (always on the last) cuts 50 evals
+#                                  to ~10 over a 50-epoch run. Eval itself is ~8x
+#                                  faster now (AMP + batch 64, see eval_batch_size).
+#   - eval_batch_size 16 -> 64:   Eval is forward-only + no_grad + AMP, so a much larger
+#                                  batch is safe and ~4x faster than the training batch.
+#
+# NOTE: LR (1e-3), encoder_lr (5e-6), warmup_steps (500), and num_epochs (50) are
+# intentionally NOT overridden. AdamW is relatively batch-size-insensitive (adaptive
+# gradients normalize away batch-size effects on optimal LR, unlike SGD's linear
+# scaling rule). total_steps auto-scales with world_size via per-rank len(dataloader).
+# The proven single-GPU values produced R@10=0.96 with no collapse.
+
+defaults:
+  - default
+  - _self_
+
+training:
+  log_frequency: 50
+  eval_every_n_epochs: 5
+
+validation:
+  eval_batch_size: 64

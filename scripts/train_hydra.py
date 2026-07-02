@@ -491,6 +491,10 @@ def evaluate_retrieval(cfg, model, dataloader, device, logger, tb_writer=None, w
     ranks return {} (metrics are only computed on rank 0).
     """
     model.eval()
+    # Eval forward uses AMP when training does — ~2x faster on A100.
+    # Convert embeddings to FP32 for ranking precision (cosine sims over
+    # ~19k candidates can accumulate FP16 rounding in the sort).
+    use_amp = cfg.training.get("mixed_precision", False) and device.type == "cuda"
     audio_embs = []
     video_embs = []
 
@@ -500,8 +504,9 @@ def evaluate_retrieval(cfg, model, dataloader, device, logger, tb_writer=None, w
             video = batch["video"].to(device)
             audio_padding_mask = batch["audio_padding_mask"].to(device)
 
-            audio_embs.append(model.encode_audio(audio, audio_padding_mask).detach())
-            video_embs.append(model.encode_video(video).detach())
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                audio_embs.append(model.encode_audio(audio, audio_padding_mask).detach().float())
+                video_embs.append(model.encode_video(video).detach().float())
 
     if not audio_embs:
         return {}
@@ -898,7 +903,10 @@ def main(cfg: DictConfig):
             select_metric=select_metric,
         )
 
-        if cfg.training.run_retrieval_eval and val_dataloader is not None:
+        eval_every_n = cfg.training.get("eval_every_n_epochs", 1)
+        is_last_epoch = epoch >= cfg.training.num_epochs
+        if (cfg.training.run_retrieval_eval and val_dataloader is not None
+                and (is_last_epoch or epoch % max(1, eval_every_n) == 0)):
             eval_model = model.module if is_ddp else model
             # Under DDP, set the val sampler epoch so sharding is deterministic
             # (though shuffle=False, set_epoch is good practice).
