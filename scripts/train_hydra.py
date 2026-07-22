@@ -425,6 +425,11 @@ def train_one_epoch(
                     "train/mlm_acc": metrics.get("mlm_acc", 0.0),
                     "train/variance_loss": metrics.get("variance_loss", 0.0),
                     "train/lr": scheduler.get_last_lr()[0],
+                    "train/lr_encoder": (
+                        scheduler.get_last_lr()[1]
+                        if len(scheduler.get_last_lr()) > 1
+                        else 0.0
+                    ),
                     "train/audio_emb_std": audio_emb.std().item(),
                     "train/video_emb_std": video_emb.std().item(),
                     "train/sim_diag_mean": diag_mean,
@@ -771,11 +776,13 @@ def main(cfg: DictConfig):
 
     # Optimizer with separate param groups.
     # During encoder warmup (freeze_encoder_epochs > 0), the encoder param
-    # group starts with lr=0 so no gradients are applied to pretrained
-    # weights — but requires_grad stays True so DDP's reducer includes them
-    # from the start. At the unfreeze epoch, the group LR is set to encoder_lr.
+    # group has base_lr=encoder_lr but a per-group LR lambda returns 0.0
+    # during freeze steps, then follows the cosine schedule after. This
+    # keeps requires_grad=True (DDP reducer tracks from start) while applying
+    # no gradients during warmup. The per-group lambda replaces the old
+    # manual unfreeze blocks that were defeated by LambdaLR's base_lr snapshot.
     encoder_lr = cfg.optimizer.get("encoder_lr", cfg.optimizer.lr)
-    encoder_init_lr = 0.0 if freeze_encoder_epochs > 0 else encoder_lr
+    encoder_init_lr = encoder_lr
     param_groups, n_new, n_enc = build_param_groups(
         model, cfg.optimizer.lr, encoder_init_lr, cfg.optimizer.weight_decay
     )
@@ -806,16 +813,26 @@ def main(cfg: DictConfig):
 
     warmup_steps = cfg.scheduler.get("warmup_steps", 0)
 
-    if cfg.scheduler.type == "cosine_with_warmup":
-        scheduler = LambdaLR(
-            optimizer,
-            lr_lambda=lambda step: cosine_with_warmup_lambda(step, warmup_steps, total_steps),
+    if cfg.scheduler.type in ("cosine_with_warmup", "cosine"):
+        sched_warmup = warmup_steps if cfg.scheduler.type == "cosine_with_warmup" else 0
+        new_lambda = lambda step: cosine_with_warmup_lambda(
+            step, sched_warmup, total_steps
         )
-    elif cfg.scheduler.type == "cosine":
-        scheduler = LambdaLR(
-            optimizer,
-            lr_lambda=lambda step: cosine_with_warmup_lambda(step, 0, total_steps),
-        )
+        lr_lambdas = [new_lambda]
+        if n_enc > 0:
+            if freeze_encoder_epochs > 0:
+                freeze_steps = (
+                    len(dataloader) * freeze_encoder_epochs
+                    // cfg.training.gradient_accumulation_steps
+                )
+                def enc_lambda(step, fs=freeze_steps, ws=sched_warmup, ts=total_steps):
+                    if step < fs:
+                        return 0.0
+                    return cosine_with_warmup_lambda(step, ws, ts)
+                lr_lambdas.append(enc_lambda)
+            else:
+                lr_lambdas.append(new_lambda)
+        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambdas)
     else:
         raise ValueError(f"Unknown scheduler type: {cfg.scheduler.type}")
 
@@ -848,37 +865,26 @@ def main(cfg: DictConfig):
         start_epoch, global_step, best_metric, best_epoch = _load_checkpoint(
             resume_from, model, optimizer, scheduler, scaler, is_ddp, logger,
         )
-        # If resuming past encoder warmup, set encoder LR to encoder_lr.
-        # Param groups were built with lr=0 for warmup; need to unfreeze.
-        if freeze_encoder_epochs > 0 and start_epoch > freeze_encoder_epochs:
-            for group in optimizer.param_groups:
-                if group.get("name") == "encoder":
-                    group["lr"] = encoder_lr
-                    break
-            logger.info(
-                f"Resumed past encoder warmup (start_epoch={start_epoch} > "
-                f"freeze_encoder_epochs={freeze_encoder_epochs}). "
-                f"Encoder param group lr set to {encoder_lr}."
-            )
+        # Fix base_lrs for encoder group (migration from old scheduler bug
+        # where encoder base_lr was pinned to 0.0 by LambdaLR). The per-group
+        # lambda now handles the freeze→unfreeze transition automatically.
+        for i, group in enumerate(optimizer.param_groups):
+            if group.get("name") == "encoder":
+                scheduler.base_lrs[i] = encoder_lr
+                break
 
     # Training loop
     for epoch in range(start_epoch, cfg.training.num_epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # Unfreeze encoders: set the encoder param group's LR from 0 to encoder_lr.
-        # No requires_grad toggling, no add_param_group — the group was in the
-        # optimizer from epoch 0 with lr=0, so DDP's reducer already tracks it.
-        # The scheduler's current lambda multiplier applies on top of this base LR.
+        # Encoder unfreeze: the per-group LR lambda automatically transitions
+        # from 0 (during freeze steps) to the cosine schedule. No manual LR
+        # override needed — the lambda handles it.
         if freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs + 1:
-            for group in optimizer.param_groups:
-                if group.get("name") == "encoder":
-                    group["lr"] = encoder_lr
-                    break
             logger.info(
-                f"Encoders UNFROZEN at epoch {epoch}. "
-                f"Encoder param group lr set to {encoder_lr}. "
-                f"(Param group already in optimizer since epoch 0 — Adam state initialized during warmup.)"
+                f"Encoders UNFROZEN at epoch {epoch} (per-group LR lambda: "
+                f"encoder lr now {encoder_lr:.2e} * cosine multiplier)."
             )
 
         logger.info(f"--- Epoch {epoch}/{cfg.training.num_epochs} ---")

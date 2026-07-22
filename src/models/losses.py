@@ -56,55 +56,63 @@ class ContrastiveLoss(nn.Module):
             loss: scalar (local-loss contribution; DDP averages across ranks).
             metrics: dict with accuracy etc.
         """
-        local_batch = audio_embeddings.shape[0]
-        device = audio_embeddings.device
+        # Cast to FP32 and disable autocast for numerical stability.
+        # Under AMP, embeddings arrive as FP16; logsumexp and the sharp
+        # softmax (τ=0.1 → logits ~[-10,10]) lose precision in FP16.
+        # The eval path already casts to FP32 before ranking — match it.
+        with torch.autocast(device_type=audio_embeddings.device.type, enabled=False):
+            audio_embeddings = audio_embeddings.float()
+            video_embeddings = video_embeddings.float()
 
-        # All-gather across DDP ranks (no-op on single GPU). Gradients flow
-        # back to each rank's own embeddings only.
-        all_audio = _gather_with_grad(audio_embeddings)  # (N, D)
-        all_video = _gather_with_grad(video_embeddings)   # (N, D)
-        global_batch = all_audio.shape[0]
+            local_batch = audio_embeddings.shape[0]
+            device = audio_embeddings.device
 
-        # Rank offset: this rank's samples occupy rows [rank*B_local, (rank+1)*B_local)
-        rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
-        offset = rank * local_batch
+            # All-gather across DDP ranks (no-op on single GPU). Gradients flow
+            # back to each rank's own embeddings only.
+            all_audio = _gather_with_grad(audio_embeddings)  # (N, D)
+            all_video = _gather_with_grad(video_embeddings)   # (N, D)
+            global_batch = all_audio.shape[0]
 
-        # Local logits: this rank's B_local audio vs ALL N video embeddings.
-        # Shape (B_local, N). Labels are the global indices of this rank's pairs.
-        logits_a = audio_embeddings @ all_video.t() / self.temperature
-        logits_v = video_embeddings @ all_audio.t() / self.temperature
-        labels = torch.arange(offset, offset + local_batch, device=device)
+            # Rank offset: this rank's samples occupy rows [rank*B_local, (rank+1)*B_local)
+            rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+            offset = rank * local_batch
 
-        if self.use_dcl:
-            # DCL: remove the positive from the denominator.
-            # The positive for row i (local index) is column labels[i] (global).
-            mask = torch.zeros_like(logits_a, dtype=torch.bool)
-            mask[torch.arange(local_batch, device=device), labels] = True
-            neg_logits_a = logits_a.masked_fill(mask, float("-inf"))
-            neg_logits_v = logits_v.masked_fill(mask, float("-inf"))
-            loss_a = (-logits_a.gather(1, labels.unsqueeze(1)).squeeze(1)
-                      + torch.logsumexp(neg_logits_a, dim=-1)).mean()
-            loss_v = (-logits_v.gather(1, labels.unsqueeze(1)).squeeze(1)
-                      + torch.logsumexp(neg_logits_v, dim=-1)).mean()
-            loss = (loss_a + loss_v) / 2.0
-        else:
-            # Standard InfoNCE with global labels.
-            loss_a = self.cross_entropy(logits_a, labels)
-            loss_v = self.cross_entropy(logits_v, labels)
-            loss = (loss_a + loss_v) / 2.0
+            # Local logits: this rank's B_local audio vs ALL N video embeddings.
+            # Shape (B_local, N). Labels are the global indices of this rank's pairs.
+            logits_a = audio_embeddings @ all_video.t() / self.temperature
+            logits_v = video_embeddings @ all_audio.t() / self.temperature
+            labels = torch.arange(offset, offset + local_batch, device=device)
 
-        # Compute accuracy (local rows only, against global candidates)
-        with torch.no_grad():
-            preds_a = logits_a.argmax(dim=1)
-            preds_v = logits_v.argmax(dim=1)
-            acc = ((preds_a == labels).float().mean().item()
-                   + (preds_v == labels).float().mean().item()) / 2.0
+            if self.use_dcl:
+                # DCL: remove the positive from the denominator.
+                # The positive for row i (local index) is column labels[i] (global).
+                mask = torch.zeros_like(logits_a, dtype=torch.bool)
+                mask[torch.arange(local_batch, device=device), labels] = True
+                neg_logits_a = logits_a.masked_fill(mask, float("-inf"))
+                neg_logits_v = logits_v.masked_fill(mask, float("-inf"))
+                loss_a = (-logits_a.gather(1, labels.unsqueeze(1)).squeeze(1)
+                          + torch.logsumexp(neg_logits_a, dim=-1)).mean()
+                loss_v = (-logits_v.gather(1, labels.unsqueeze(1)).squeeze(1)
+                          + torch.logsumexp(neg_logits_v, dim=-1)).mean()
+                loss = (loss_a + loss_v) / 2.0
+            else:
+                # Standard InfoNCE with global labels.
+                loss_a = self.cross_entropy(logits_a, labels)
+                loss_v = self.cross_entropy(logits_v, labels)
+                loss = (loss_a + loss_v) / 2.0
 
-        metrics = {
-            "contrastive_loss": loss.item(),
-            "contrastive_acc": acc,
-        }
-        return loss, metrics
+            # Compute accuracy (local rows only, against global candidates)
+            with torch.no_grad():
+                preds_a = logits_a.argmax(dim=1)
+                preds_v = logits_v.argmax(dim=1)
+                acc = ((preds_a == labels).float().mean().item()
+                       + (preds_v == labels).float().mean().item()) / 2.0
+
+            metrics = {
+                "contrastive_loss": loss.item(),
+                "contrastive_acc": acc,
+            }
+            return loss, metrics
 
 
 class VarianceLoss(nn.Module):
@@ -126,15 +134,18 @@ class VarianceLoss(nn.Module):
         self.eps = eps
 
     def forward(self, *embeddings: torch.Tensor) -> torch.Tensor:
-        loss = embeddings[0].new_tensor(0.0)
-        for z in embeddings:
-            # Gather across DDP ranks so std is measured over the global batch
-            # (a per-rank std could miss cross-rank collapse). No-op on single GPU.
-            z_global = _gather_with_grad(z)
-            # std per dimension across the batch (biased estimator + eps)
-            std = torch.sqrt(z_global.var(dim=0, unbiased=False) + self.eps)
-            loss = loss + torch.mean(torch.relu(self.gamma - std))
-        return loss / len(embeddings)
+        # Cast to FP32 and disable autocast (matches ContrastiveLoss).
+        with torch.autocast(device_type=embeddings[0].device.type, enabled=False):
+            loss = embeddings[0].new_tensor(0.0)
+            for z in embeddings:
+                z = z.float()
+                # Gather across DDP ranks so std is measured over the global batch
+                # (a per-rank std could miss cross-rank collapse). No-op on single GPU.
+                z_global = _gather_with_grad(z)
+                # std per dimension across the batch (biased estimator + eps)
+                std = torch.sqrt(z_global.var(dim=0, unbiased=False) + self.eps)
+                loss = loss + torch.mean(torch.relu(self.gamma - std))
+            return loss / len(embeddings)
 
 
 class MLMLoss(nn.Module):
@@ -244,10 +255,21 @@ class CombinedLoss(nn.Module):
             total_loss += self.contrastive_weight * loss_cont
             metrics.update(metrics_cont)
 
-        # VICReg variance regularization (anti-collapse)
+        # VICReg variance regularization (anti-collapse).
+        # Scale by world_size: VarianceLoss gathers global embeddings and
+        # produces the same scalar on every rank, but DDP averages gradients
+        # across ranks (÷ world_size). The contrastive loss is a true per-rank
+        # mean so DDP averaging yields the correct global mean — but the
+        # variance term's gradient is (1/world_size) of what it should be.
+        # Without this fix, variance_weight=0.5 becomes 0.0625 on 8 GPUs.
         if self.variance_weight > 0:
             loss_var = self.variance(audio_embeddings, video_embeddings)
-            total_loss = total_loss + self.variance_weight * loss_var
+            ws = (
+                dist.get_world_size()
+                if (dist.is_available() and dist.is_initialized())
+                else 1
+            )
+            total_loss = total_loss + self.variance_weight * ws * loss_var
             metrics["variance_loss"] = loss_var.item()
 
         # MLM loss

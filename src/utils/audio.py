@@ -20,8 +20,11 @@ def _load_audio_segment(
     """
     import av
 
-    # Suppress harmless libav warnings (e.g. "Referenced QT chapter track not found")
-    av.logging.set_level(av.logging.ERROR)
+    # Suppress libav log output (harmless warnings from old/corrupt AAC frames:
+    # "decode_pce", "Referenced QT chapter track not found", "illegal icc").
+    # set_level(None) replaces the FFmpeg callback with a no-op — total silence.
+    # Errors are still handled per-frame via try/except + zero-pad fallback below.
+    av.logging.set_level(None)
 
     duration = end_sec - start_sec
     num_samples = max(1, int(duration * target_sample_rate))
