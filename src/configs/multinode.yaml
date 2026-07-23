@@ -5,10 +5,12 @@
 # Rationale for overrides:
 #   - batch_size 64 -> 128:       Doubles per-GPU batch. More negatives per DCL step.
 #                                  Monitor GPU memory — if OOM, drop to 96.
-#   - num_workers 12 -> 8:        CPU was at ~30% with 48 workers (4×12). Reducing to
-#                                  32 workers (4×8) saves ~32 GB RAM with negligible
+#   - num_workers 12 -> 4:        CPU was at ~30% with 48 workers (4×12). Reducing to
+#                                  16 workers (4×4) saves ~64 GB RAM with negligible
 #                                  throughput impact (data_time_avg was ~0.06s vs
 #                                  ~10s forward — prefetch massively over-provisioned).
+#                                  Also reduces thread/process pressure on SLURM cgroups
+#                                  (OpenCV parallel threads disabled via setNumThreads(0)).
 #   - prefetch_factor 4 -> 2:     Queue depth was 4×12=48 batches (~300s buffer) vs
 #                                  ~10s/step needed. Halving saves ~75 GB pinned RAM.
 #                                  Queue still 2×8=16 batches (~100s buffer) — plenty.
@@ -38,7 +40,7 @@ defaults:
 
 dataloader:
   batch_size: 128
-  num_workers: 8
+  num_workers: 4
   prefetch_factor: 2
 
 training:

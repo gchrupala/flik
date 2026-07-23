@@ -4,6 +4,14 @@ import numpy as np
 from PIL import Image
 from typing import List, Optional, Tuple
 
+# Disable OpenCV's internal parallel-for thread pool. Each DataLoader worker is
+# already a separate process; parallelism comes from multiple workers, not from
+# threads within each worker. Without this, every worker spawns an OpenCV thread
+# pool (default = all CPU cores), which exhausts the SLURM cgroup thread limit
+# (ulimit -u) when running 4 ranks × 8 workers = 32 workers on one node.
+# 0 = do everything in the calling thread, spawn no extra threads.
+cv2.setNumThreads(0)
+
 # VideoMAE preprocessing: resize 224x224, ImageNet normalization
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 

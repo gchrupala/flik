@@ -21,30 +21,31 @@ dependencies = [
 # whisperx pins torch~=2.8.0, and torch 2.8.x is only published for cu128 (+cpu),
 # so only these two variants are resolvable. See AGENTS.md for adding more.
 [project.optional-dependencies]
-cpu = [
-    "torch~=2.8.0",
-    "torchaudio~=2.8.0",
-]
+cpu = ["torch~=2.8.0", "torchaudio~=2.8.0", "torchvision~=0.23.0"]
 cu128 = [
     "torch~=2.8.0",
     "torchaudio~=2.8.0",
+    "torchvision~=0.23.0",
+    # Explicit nvidia CUDA libs — uv's resolver sometimes doesn't pull these
+    # platform-specific wheels from torch's dependency metadata. Without them,
+    # torch fails at import with "libcudnn.so.9: cannot open shared object file".
+    "nvidia-cudnn-cu12>=9.0",
+    "nvidia-cublas-cu12>=12.0",
+    "nvidia-cuda-runtime-cu12>=12.0",
+    "nvidia-cuda-nvrtc-cu12>=12.0",
+    "nvidia-cufft-cu12>=11.0",
+    "nvidia-cusparse-cu12>=12.0",
+    "nvidia-nccl-cu12>=2.20",         # Required for DDP (NCCL backend)
+    "nvidia-nvjitlink-cu12>=12.0",
 ]
 
 [dependency-groups]
-dev = [
-    "tensorboard>=2.20.0",
-    "wandb>=0.26.1",
-]
+dev = ["tensorboard>=2.20.0", "wandb>=0.26.1"]
 
 [tool.uv]
 # The accelerator extras are mutually exclusive — pick exactly one via:
 #   uv sync --extra cpu | cu128
-conflicts = [
-    [
-        { extra = "cpu" },
-        { extra = "cu128" },
-    ],
-]
+conflicts = [[{ extra = "cpu" }, { extra = "cu128" }]]
 
 [tool.uv.sources]
 torch = [
@@ -52,6 +53,10 @@ torch = [
     { index = "pytorch-cu128", extra = "cu128" },
 ]
 torchaudio = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "cu128" },
+]
+torchvision = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu128", extra = "cu128" },
 ]
