@@ -17,10 +17,11 @@
 #   - log_frequency 10 -> 50:     Multi-node has fewer steps/epoch (data split across
 #                                  ranks), so 10-step logging is too verbose. 50 gives
 #                                  ~7 logs/epoch on 8-GPU vs ~35 at the default.
-#   - eval_every_n_epochs 1 -> 5: Eval on ~19k val segments is expensive. Running it
-#                                  every 5 epochs (always on the last) cuts 50 evals
-#                                  to ~10 over a 50-epoch run. Eval itself is ~8x
-#                                  faster now (AMP + batch 64, see eval_batch_size).
+#   - eval_every_n_epochs 1 -> 2: Eval on ~19k val segments is expensive. Running it
+#                                  every 2 epochs (always on the last) gives early
+#                                  signal around the encoder-unfreeze transition
+#                                  (epoch 4). Eval itself is ~8x faster now (AMP +
+#                                  batch 64, see eval_batch_size).
 #   - eval_batch_size 16 -> 64:   Eval is forward-only + no_grad + AMP, so a much larger
 #                                  batch is safe and ~4x faster than the training batch.
 #   - use_wandb false -> true:    Enable WandB logging by default for multinode runs.
@@ -39,13 +40,13 @@ defaults:
   - _self_
 
 dataloader:
-  batch_size: 128
+  batch_size: 80
   num_workers: 4
   prefetch_factor: 2
 
 training:
   log_frequency: 50
-  eval_every_n_epochs: 5
+  eval_every_n_epochs: 2
 
 logging:
   use_wandb: true

@@ -685,6 +685,23 @@ def main(cfg: DictConfig):
         val_dataloader = DataLoader(val_dataset, **val_dl_kwargs)
         logger.info(f"Validation dataset size: {len(val_dataset)} (batch_size={cfg.validation.eval_batch_size})")
 
+    # Pre-download HuggingFace models on rank 0 before all ranks construct
+    # FlikModel. Without this, all ranks call from_pretrained() simultaneously,
+    # racing on the same HF cache directory (os.environ["HF_HOME"]). On GPFS
+    # and other shared filesystems this causes partial writes, corrupt cache
+    # entries, and DDP parameter count mismatches (e.g. rank 0 has 467 params
+    # while rank 1 has 0). Fix: rank 0 downloads first, barrier, then all ranks
+    # construct the model from the now-complete cache.
+    if is_ddp:
+        if rank == 0:
+            logger.info("Rank 0: pre-downloading HuggingFace models to cache...")
+            from transformers import Wav2Vec2Model, VideoMAEModel
+            Wav2Vec2Model.from_pretrained(cfg.model.audio_model_name)
+            VideoMAEModel.from_pretrained(cfg.model.video_model_name)
+            logger.info("Rank 0: model download complete.")
+        dist.barrier()
+        logger.info(f"Rank {rank}: constructing FlikModel (cache populated)")
+
     # Model
     model = FlikModel(
         audio_model_name=cfg.model.audio_model_name,

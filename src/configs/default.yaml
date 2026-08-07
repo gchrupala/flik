@@ -47,7 +47,7 @@ training:
   clip_grad_norm: 1.0
   mixed_precision: true  # use AMP (now actually honored)
   gradient_checkpointing: true  # trade compute for memory on large batches
-  freeze_encoder_epochs: 5  # freeze pretrained encoders for first N epochs (projection head warmup)
+  freeze_encoder_epochs: 3  # freeze pretrained encoders for first N epochs (projection head warmup)
   checkpoint_dir: "checkpoints"
   checkpoint_frequency: 1000  # steps
   eval_every_n_epochs: 1  # run retrieval eval every N epochs (always on last epoch); 1 = every epoch
