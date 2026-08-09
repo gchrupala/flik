@@ -7,6 +7,9 @@
 #SBATCH --time=24:00:00
 #SBATCH --job-name=flik-train
 #SBATCH --output=logdir/train-%j.out
+#SBATCH --error=logdir/train-%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=g.shen@tilburguniversity.edu
 
 # ====================================================================
 # Flik training on Snellius (A100, multi-node DDP)
@@ -20,7 +23,11 @@
 #   4 GPUs × 72h = 36,864 SBUs  (1 node)
 #
 # Estimated training time: ~64h for 50 epochs (17,800 steps @ ~13s/step)
-# Walltime 72h gives ~8h buffer for eval + checkpointing + startup.
+# on 4 GPUs; roughly half that on 8 GPUs.
+#
+# PITFALL: a SLURM batch script executes ONLY on the first allocated
+# node. Multi-node launches MUST go through srun (see bottom of script)
+# or the extra nodes idle and the rendezvous times out.
 # ====================================================================
 
 set -euo pipefail
@@ -42,23 +49,42 @@ export OMP_NUM_THREADS=1
 export OPENCV_FFMPEG_THREADS=1
 ulimit -u 65536 2>/dev/null || true
 
+# NCCL network config (required for multi-node on Snellius).
+# NCCL's bootstrap TCP connections must go over the high-speed node
+# interconnect, not the management interface. "eno" prefix-matches the
+# Snellius compute-node interface (eno1). Without this, NCCL can hang at
+# init with no useful error. NCCL_DEBUG=INFO logs the chosen interface
+# and transport (IB vs TCP) at startup - check it on the first run.
+export NCCL_SOCKET_IFNAME="eno"
+export NCCL_DEBUG=INFO
+
 # Reduce PyTorch CUDA memory fragmentation over long runs
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# SLURM_GPUS_PER_NODE reflects the --gpus-per-node request (used by the
+# proven working job script); SLURM_GPUS_ON_NODE is the per-node variant.
+GPUS_PER_NODE="${SLURM_GPUS_PER_NODE:-${SLURM_GPUS_ON_NODE:-4}}"
 
 echo "=== Job Info ==="
 echo "Job ID:       $SLURM_JOB_ID"
 echo "Nodes:        $SLURM_JOB_NUM_NODES"
-echo "GPUs/node:    $SLURM_GPUS_ON_NODE"
-echo "Total GPUs:   $((SLURM_JOB_NUM_NODES * SLURM_GPUS_ON_NODE))"
+echo "GPUs/node:    $GPUS_PER_NODE"
+echo "Total GPUs:   $((SLURM_JOB_NUM_NODES * GPUS_PER_NODE))"
 echo "Working dir:  $SLURM_SUBMIT_DIR"
 echo "Start time:   $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo ""
 
+# HF cache: must match what scripts/train_hydra.py uses (<repo>/cache).
+# Without this export, the pre-download below populates ~/.cache/huggingface
+# while the training script reads <repo>/cache - i.e. the pre-download would
+# be useless and every rank would re-download simultaneously (GPFS race).
+export HF_HOME="${SLURM_SUBMIT_DIR}/cache"
+
 # Pre-download HuggingFace models BEFORE launching torchrun.
-# This avoids the GPFS cache race condition where multiple ranks call
-# from_pretrained() simultaneously on the same cache directory.
-# (The training script also has a rank-0-first barrier, but pre-downloading
-# here is even safer - the models are cached before any DDP process starts.)
+# Runs on the batch host only, but the cache is shared GPFS so all nodes
+# see it. This avoids the GPFS cache race condition where multiple ranks
+# call from_pretrained() simultaneously on the same cache directory.
+# (The training script also has a rank-0-first barrier as a fallback.)
 echo "=== Pre-downloading HuggingFace models ==="
 python -c "
 from transformers import Wav2Vec2Model, VideoMAEModel
@@ -78,10 +104,19 @@ echo "MASTER_PORT:  $MASTER_PORT"
 echo "Config:       multinode"
 echo ""
 
-torchrun \
+# srun is REQUIRED here: a SLURM batch script only executes on the first
+# allocated node, so a bare `torchrun` would start a single agent on the
+# head node, which then waits forever at the rendezvous for agents on the
+# other nodes that never launch (RendezvousTimeoutError after 600s).
+# srun launches one torchrun per node (--ntasks-per-node=1); each agent
+# then spawns --nproc-per-node local workers.
+# --rdzv-id ties the rendezvous to this job so a port collision with
+# another job on the same node can't cross-wire the stores.
+srun torchrun \
     --nnodes="$SLURM_JOB_NUM_NODES" \
-    --nproc-per-node="$SLURM_GPUS_ON_NODE" \
+    --nproc-per-node="$GPUS_PER_NODE" \
     --rdzv-backend=c10d \
+    --rdzv-id="$SLURM_JOB_ID" \
     --rdzv-endpoint="$MASTER_ADDR:$MASTER_PORT" \
     -m scripts.train_hydra --config-name=multinode
 
