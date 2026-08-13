@@ -14,6 +14,8 @@ from tqdm.auto import tqdm
 from transformers import CLIPModel, CLIPProcessor
 
 # Config
+from src.utils.paths import resolve_path
+
 from src.CONSTANTS import (
     PROJECT_ROOT,
     OUTPUT_MANIFEST as MANIFEST_FILE,
@@ -43,6 +45,11 @@ _BATCH_SIZE = CLIP_BATCH_SIZE
 _NUM_WORKERS = CLIP_NUM_WORKERS
 _USE_FP16 = True
 _DECODER = "cpu"  # "cpu" or "nvdec"
+
+# COCO baseline config (overridable via CLI, used by --mode coco)
+COCO_ANNOTATIONS = "~/corpora/MSCOCO-2017/captions_val2017.json"
+COCO_IMAGES = "~/corpora/MSCOCO-2017/val2017/"
+COCO_LIMIT = 0  # 0 = score all images; >0 caps the number of images (smoke tests)
 
 # Set up logging
 logging.basicConfig(
@@ -131,8 +138,12 @@ def _score_pairs_batched(model, processor, texts, images, device, use_fp16):
     Returns:
         list of B float scores (one per pair).
     """
+    # Full text is passed here; the tokenizer truncates to CLIP_TOKEN_LIMIT
+    # tokens (77) via truncation=True. (Earlier code sliced text to 77
+    # CHARACTERS, discarding most of each segment's content.)
     inputs = processor(
-        text=texts, images=images, return_tensors="pt", padding=True
+        text=texts, images=images, return_tensors="pt", padding=True,
+        truncation=True, max_length=CLIP_TOKEN_LIMIT,
     ).to(device)
     with torch.no_grad():
         if use_fp16 and device.type == "cuda":
@@ -245,100 +256,147 @@ def _run_decode_score_pipeline(model, processor, decode_units, device, desc):
     # Max per segment (best frame-text alignment)
     return {sid: max(scores) for sid, scores in seg_frame_scores.items()}
 
-
-def establish_clip_score_baseline():
+def check_coco_clip_scores():
     """
-    Establish a baseline CLIP score by using the MSCOCO dataset captions and images.
-    Use matched pairs for the topline score, and random pairs for the baseline score.
-    This helps to understand what a "low" or "random" alignment score looks like.
-    """
+    Establish a CLIP calibration baseline on MSCOCO 2017 val captions+images.
 
-    # Load MSCOCO 2017 validation set from json and into HF dataset
-    dataset_json = os.path.expanduser("~/corpora/MSCOCO-2017/captions_val2017.json")
-    images_root = os.path.expanduser("~/corpora/MSCOCO-2017/val2017/")
+    Computes (a) *matched* scores on true image<->caption pairs (the topline)
+    and (b) *random* scores on shuffled pairings that EXCLUDE the true caption
+    (the null). Reports summary stats and saves both lists + stats to
+    ``data/clip_baseline_scores_coco.json``.
+
+    This is a calibration reference: it tells us what an "aligned" vs a
+    "random" text<->image CLIP score looks like on a known-aligned dataset, so
+    we can interpret the flik video<->transcript alignment scores (and sanity
+    check percentile/z thresholds).
+
+    Run:
+        uv run --extra cu128 python -m src.preprocess.check_correspondance \
+            --mode coco [--coco-annotations ...] [--coco-images ...] [--coco-limit N]
+    """
+    dataset_json = os.path.expanduser(COCO_ANNOTATIONS)
+    images_root = os.path.expanduser(COCO_IMAGES)
+    if not os.path.isfile(dataset_json):
+        logger.error(f"COCO annotations not found: {dataset_json}")
+        return
+    if not os.path.isdir(images_root):
+        logger.error(f"COCO images root not found: {images_root}")
+        return
+
     with open(dataset_json, "r") as f:
         data = json.load(f)
     annotations = data["annotations"]
     images_info = {img["id"]: img for img in data["images"]}
-    from datasets import Dataset
 
-    records = []
-    for ann in annotations:
-        img_info = images_info[ann["image_id"]]
-        records.append(
-            {
-                "image_path": os.path.join(images_root, img_info["file_name"]),
-                "caption": ann["caption"],
-            }
-        )
-    dataset = Dataset.from_list(records)
+    records = [
+        {
+            "image_id": ann["image_id"],
+            "image_path": os.path.join(images_root, images_info[ann["image_id"]]["file_name"]),
+            "caption": ann["caption"],
+        }
+        for ann in annotations
+    ]
 
-    # Load CLIP model
-    logger.info(f"Loading CLIP ({DEVICE}) for baseline establishment...")
+    # Optional cap on the number of *images* (keeps an image's 5 captions together).
+    if COCO_LIMIT > 0:
+        seen = set()
+        capped = []
+        for r in records:
+            if len(seen) >= COCO_LIMIT:
+                break
+            seen.add(r["image_id"])
+            capped.append(r)
+        records = capped
+
+    n_images = len({r["image_id"] for r in records})
+    logger.info(f"Loaded {len(records)} COCO caption<->image pairs ({n_images} images)")
+
+    # Load CLIP once.
+    logger.info(f"Loading CLIP ({DEVICE}) for COCO baseline...")
     model = CLIPModel.from_pretrained(CLIP_MODEL).to(DEVICE)
     processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
 
-    # Compute matched scores
-    matched_scores = {"text-to-image": [], "image-to-text": []}
-    for item in tqdm(dataset, desc="Computing matched scores"):
-        image = Image.open(item["image_path"]).convert("RGB")
-        caption = item["caption"][:CLIP_TOKEN_LIMIT]  # CLIP limit
+    # Preload all images once (avoids re-opening per pair).
+    logger.info("Loading images...")
+    images = [Image.open(r["image_path"]).convert("RGB") for r in records]
+    captions = [r["caption"] for r in records]
+    image_ids = [r["image_id"] for r in records]
 
-        inputs = processor(
-            text=[caption], images=[image], return_tensors="pt", padding=True
-        ).to(DEVICE)
+    def _batched_scores(texts, imgs):
+        """Score all (text, image) pairs in batches via the diagonal."""
+        scores = []
+        for s in range(0, len(imgs), _BATCH_SIZE):
+            scores.extend(
+                _score_pairs_batched(
+                    model, processor, texts[s:s + _BATCH_SIZE], imgs[s:s + _BATCH_SIZE],
+                    DEVICE, _USE_FP16,
+                )
+            )
+        return scores
 
-        with torch.no_grad():
-            out = model(**inputs)
+    def _stats(vals):
+        return {
+            "mean": float(np.mean(vals)),
+            "std": float(np.std(vals)),
+            "min": float(np.min(vals)),
+            "max": float(np.max(vals)),
+            "percentiles": {
+                "p5": float(np.percentile(vals, 5)),
+                "p25": float(np.percentile(vals, 25)),
+                "p50": float(np.percentile(vals, 50)),
+                "p75": float(np.percentile(vals, 75)),
+                "p95": float(np.percentile(vals, 95)),
+            },
+            "count": len(vals),
+        }
 
-        itt_score = out.logits_per_image.item()
-        tti_score = out.logits_per_text.item()
-        matched_scores["image-to-text"].append(itt_score)
-        matched_scores["text-to-image"].append(tti_score)
-    avg_matched_itt_score = np.mean(matched_scores["image-to-text"])
-    avg_matched_tti_score = np.mean(matched_scores["text-to-image"])
+    # --- Matched scores (true image<->caption) ---
+    logger.info("Computing matched text-image scores...")
+    matched_itt = _batched_scores(captions, images)
+    matched_stats = _stats(matched_itt)
     logger.info(
-        f"Average matched image-to-text CLIP score: {avg_matched_itt_score:.4f}"
+        f"Matched image-to-text CLIP: mean={matched_stats['mean']:.4f} "
+        f"std={matched_stats['std']:.4f} (n={matched_stats['count']})"
     )
+
+    # --- Random scores (shuffled pairing, EXCLUDING the true caption) ---
+    logger.info("Computing random (shuffled, true-caption-excluded) scores...")
+    pool = list(zip(captions, image_ids))
+    n_unique_ids = n_images
+    random_captions = []
+    for img_id in tqdm(image_ids, desc="Random pairing"):
+        while True:
+            cap, cid = random.choice(pool)
+            if cid != img_id:
+                break
+            if n_unique_ids == 1:
+                # Degenerate: only one image's captions exist, so no "other".
+                cap, cid = pool[0]
+                break
+        random_captions.append(cap)
+    random_itt = _batched_scores(random_captions, images)
+    random_stats = _stats(random_itt)
     logger.info(
-        f"Average matched text-to-image CLIP score: {avg_matched_tti_score:.4f}"
+        f"Random image-to-text CLIP: mean={random_stats['mean']:.4f} "
+        f"std={random_stats['std']:.4f} (n={random_stats['count']})"
     )
 
-    # Compute random scores
-    random_scores = {
-        "text-to-image": [],
-        "image-to-text": [],
+    # --- Save + report ---
+    combined = {
+        "matched": matched_itt,
+        "random": random_itt,
+        "matched_stats": matched_stats,
+        "random_stats": random_stats,
     }
-    captions = [item["caption"][:CLIP_TOKEN_LIMIT] for item in dataset]
-    for item in tqdm(dataset, desc="Computing random scores"):
-        image = Image.open(item["image_path"]).convert("RGB")
-        random_caption = random.choice(captions)
+    out_path = os.path.join(PROJECT_ROOT, "data/clip_baseline_scores_coco.json")
+    with open(out_path, "w") as f:
+        json.dump(combined, f, indent=2, default=float)
+    logger.info(f"Saved COCO baseline to {out_path}")
+    logger.info(
+        f"Calibration: random {random_stats['mean']:.3f} vs matched "
+        f"{matched_stats['mean']:.3f} (delta {matched_stats['mean'] - random_stats['mean']:+.3f})"
+    )
 
-        inputs = processor(
-            text=[random_caption], images=[image], return_tensors="pt", padding=True
-        ).to(DEVICE)
-
-        with torch.no_grad():
-            out = model(**inputs)
-
-        itt_score = out.logits_per_image.item()
-        tti_score = out.logits_per_text.item()
-        random_scores["image-to-text"].append(itt_score)
-        random_scores["text-to-image"].append(tti_score)
-    avg_random_itt_score = np.mean(random_scores["image-to-text"])
-    avg_random_tti_score = np.mean(random_scores["text-to-image"])
-    logger.info(f"Average random image-to-text CLIP score: {avg_random_itt_score:.4f}")
-    logger.info(f"Average random text-to-image CLIP score: {avg_random_tti_score:.4f}")
-
-    # Save both random and normal results for future reference
-    combined_results = {
-        "matched": matched_scores,
-        "random": random_scores,
-    }
-    with open(
-        os.path.join(PROJECT_ROOT, "data/clip_baseline_scores_coco.json"), "w"
-    ) as f:
-        json.dump(combined_results, f, indent=2)
 
 
 def main():
@@ -365,7 +423,7 @@ def main():
 
     for task_idx, task in enumerate(tqdm(tasks, desc="Reading transcripts")):
         try:
-            with open(task["json_path"], "r") as f:
+            with open(resolve_path(task["json_path"]), "r") as f:
                 data = json.load(f)
             segments = data.get("segments", []) if isinstance(data, dict) else data
 
@@ -380,9 +438,9 @@ def main():
             task_segs = []
             for seg in selected:
                 gidx = len(decode_units)
-                text = seg["text"][:CLIP_TOKEN_LIMIT]
+                text = seg["text"]  # full text; tokenizer truncates to 77 tokens
                 decode_units.append(
-                    (gidx, task["video_path"], seg["start"], seg["end"], text)
+                    (gidx, resolve_path(task["video_path"]), seg["start"], seg["end"], text)
                 )
                 task_segs.append((gidx, seg))
             task_segments[task_idx] = task_segs
@@ -528,9 +586,13 @@ def check_randomized():
     decode_units = []  # (idx, video_path, start, end, text)
 
     for task in tqdm(random_tasks, desc="Sampling segments"):
-        with open(task["json_path"], "r") as f:
-            data = json.load(f)
-        segments = data.get("segments", []) if isinstance(data, dict) else data
+        try:
+            with open(resolve_path(task["json_path"]), "r") as f:
+                data = json.load(f)
+            segments = data.get("segments", []) if isinstance(data, dict) else data
+        except Exception as e:
+            logger.warning(f"Failed to load transcript for {task.get('id', '?')}: {e}")
+            continue
 
         valid_segs = [s for s in segments if (s["end"] - s["start"]) > 2.0]
         if not valid_segs:
@@ -539,9 +601,9 @@ def check_randomized():
         selected = random.sample(valid_segs, min(SAMPLES_PER_VIDEO, len(valid_segs)))
 
         for seg in selected:
-            text = seg["text"][:CLIP_TOKEN_LIMIT]
+            text = seg["text"]  # full text; tokenizer truncates to 77 tokens
             decode_units.append(
-                (len(decode_units), task["video_path"], seg["start"], seg["end"], text)
+                (len(decode_units), resolve_path(task["video_path"]), seg["start"], seg["end"], text)
             )
 
     # 3. Shuffle texts to create random text-frame pairings
@@ -636,27 +698,6 @@ def check_output():
         print(
             f"{row['id']}: raw={row['avg_clip_score_raw']:.3f}, z={row.get('avg_clip_score_z', 'NA')}, percentile={row.get('avg_clip_score_percentile', 'NA')}"
         )
-
-
-def check_coco_clip_scores():
-    baseline_file = os.path.join(PROJECT_ROOT, "data/clip_baseline_scores_coco.json")
-    with open(baseline_file, "r") as f:
-        baseline_scores = json.load(f)
-
-    import pandas as pd
-
-    matched_itt_df = pd.DataFrame(
-        baseline_scores["matched"]["image-to-text"], columns=["clip_score"]
-    )
-    random_itt_df = pd.DataFrame(
-        baseline_scores["random"]["image-to-text"], columns=["clip_score"]
-    )
-
-    print("Matched Image-to-Text CLIP Scores:")
-    print(matched_itt_df["clip_score"].describe())
-
-    print("\nRandom Image-to-Text CLIP Scores:")
-    print(random_itt_df["clip_score"].describe())
 
 
 def compute_random_baseline_stats():
@@ -797,13 +838,50 @@ if __name__ == "__main__":
         action="store_false",
         help="Disable FP16, use FP32 (slower but bit-exact)",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible segment sampling and null baseline "
+             "(default: 42). Use the same seed for --mode randomized and "
+             "--mode main so the null distribution is stable across runs.",
+    )
+    parser.add_argument(
+        "--coco-annotations",
+        type=str,
+        default="~/corpora/MSCOCO-2017/captions_val2017.json",
+        help="Path to MSCOCO 2017 captions JSON (used by --mode coco)",
+    )
+    parser.add_argument(
+        "--coco-images",
+        type=str,
+        default="~/corpora/MSCOCO-2017/val2017/",
+        help="Root directory of MSCOCO 2017 val images (used by --mode coco)",
+    )
+    parser.add_argument(
+        "--coco-limit",
+        type=int,
+        default=0,
+        help="Cap on number of COCO images to score in --mode coco (0 = all)",
+    )
     args = parser.parse_args()
+
+    # Seed RNG for reproducible segment sampling / null baseline.
+    # Each mode runs in its own process, so a fixed seed here makes the
+    # sampled segments and the randomized null deterministic run-to-run.
+    random.seed(args.seed)
+    logger.info(f"RNG seed: {args.seed}")
 
     # Apply performance settings
     _BATCH_SIZE = args.batch_size
     _NUM_WORKERS = args.num_workers
     _USE_FP16 = args.fp16
     _DECODER = args.decoder
+
+    # COCO baseline overrides (module-level assignment rebinds the globals)
+    COCO_ANNOTATIONS = args.coco_annotations
+    COCO_IMAGES = args.coco_images
+    COCO_LIMIT = args.coco_limit
 
     # Override DEVICE if specified
     if args.device is not None:

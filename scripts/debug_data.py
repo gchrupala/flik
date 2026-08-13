@@ -16,6 +16,7 @@ from collections import Counter
 from src.datasets.video_audio_dataset import VideoAudioDataset
 from src.utils.video import video_to_tensor
 from src.utils.audio import audio_to_tensor
+from src.utils.paths import resolve_path
 from src.models.flik_model import FlikModel
 from src.models.losses import ContrastiveLoss
 
@@ -39,8 +40,8 @@ def check_manifest_paths():
     missing_videos = []
     missing_jsons = []
     for seg in manifest:
-        vp = seg["video_path"]
-        jp = seg.get("json_path", "")
+        vp = resolve_path(seg["video_path"])
+        jp = resolve_path(seg.get("json_path", ""))
         if not os.path.exists(vp):
             missing_videos.append(vp)
         if jp and not os.path.exists(jp):
@@ -69,7 +70,7 @@ def check_single_load():
 
     seg = None
     for s in manifest:
-        if os.path.exists(s["video_path"]):
+        if os.path.exists(resolve_path(s["video_path"])):
             seg = s
             break
 
@@ -86,7 +87,7 @@ def check_single_load():
 
     # Test video loading
     try:
-        video = video_to_tensor(seg["video_path"], seg["start_sec"], seg["end_sec"], num_frames=16)
+        video = video_to_tensor(resolve_path(seg["video_path"]), seg["start_sec"], seg["end_sec"], num_frames=16)
         print(f"  Video tensor: {video.shape}, dtype={video.dtype}, "
               f"min={video.min():.4f}, max={video.max():.4f}, "
               f"mean={video.mean():.4f}, nonzero_frac={video.sum(dim=(1,2,3)).abs().bool().float().mean().item():.3f}")
@@ -96,7 +97,7 @@ def check_single_load():
 
     # Test audio loading
     try:
-        audio = audio_to_tensor(seg["video_path"], seg["start_sec"], seg["end_sec"], sample_rate=16000)
+        audio = audio_to_tensor(resolve_path(seg["video_path"]), seg["start_sec"], seg["end_sec"], sample_rate=16000)
         energy = (audio ** 2).mean().item()
         print(f"  Audio tensor: {audio.shape}, dtype={audio.dtype}, "
               f"min={audio.min():.4f}, max={audio.max():.4f}, "

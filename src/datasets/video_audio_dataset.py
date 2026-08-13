@@ -8,6 +8,9 @@ import os
 # Local imports
 from ..utils.video import video_to_tensor
 from ..utils.audio import audio_to_tensor
+from ..utils.segments import in_duration_range
+from ..utils.paths import resolve_path
+from ..utils.segments import merge_segments
 
 
 class VideoAudioDataset(Dataset):
@@ -23,6 +26,7 @@ class VideoAudioDataset(Dataset):
         num_frames: int = 16,
         min_duration: float = 3.0,
         max_duration: float = 10.0,
+        max_gap: float = 1.0,
         dummy: bool = False,
         manifest_items: Optional[List[Dict[str, Any]]] = None,
     ):
@@ -39,6 +43,7 @@ class VideoAudioDataset(Dataset):
         self.num_frames = num_frames
         self.min_duration = min_duration
         self.max_duration = max_duration
+        self.max_gap = max_gap
         self.dummy = dummy
 
         if manifest_items is not None:
@@ -68,16 +73,16 @@ class VideoAudioDataset(Dataset):
             if not self.dummy and "start_sec" in item and "end_sec" in item:
                 # Segment-level manifest item
                 dur = item["end_sec"] - item["start_sec"]
-                if dur < self.min_duration or dur > self.max_duration:
+                if not in_duration_range(dur, self.min_duration, self.max_duration):
                     continue
                 segments.append(
                     {
                         "id": item.get(
                             "id",
-                            f"{item.get('video_id', 'segment')}_{item['start_sec']:.1f}_{item['end_sec']:.1f}",
+                            f"{item.get('video_id', 'segment')}_{item['start_sec']:.2f}_{item['end_sec']:.2f}",
                         ),
-                        "video_path": item["video_path"],
-                        "json_path": item.get("json_path", ""),
+                        "video_path": resolve_path(item["video_path"]),
+                        "json_path": resolve_path(item.get("json_path", "")),
                         "start_sec": item["start_sec"],
                         "end_sec": item["end_sec"],
                         "text": item.get("text", ""),
@@ -103,25 +108,30 @@ class VideoAudioDataset(Dataset):
             else:
                 # Load actual segments from WhisperX JSON
                 try:
-                    with open(item["json_path"], "r", encoding="utf-8") as f:
+                    with open(resolve_path(item["json_path"]), "r", encoding="utf-8") as f:
                         transcript = json.load(f)
                 except Exception as e:
                     print(f"Warning: Failed to load {item['json_path']}: {e}")
                     continue
 
-                # transcript is a list of segments, each with 'start', 'end', 'text'
-                for seg in transcript:
-                    dur = seg["end"] - seg["start"]
-                    if dur < self.min_duration or dur > self.max_duration:
-                        continue
+                # Merge consecutive segments into [min,max] windows (rescues the
+                # sub-minimum utterance fragments Whisper produces in dialogue).
+                # Same logic as scripts/expand_and_validate_manifest.py.
+                for w in merge_segments(
+                    transcript,
+                    min_duration=self.min_duration,
+                    max_duration=self.max_duration,
+                    max_gap=self.max_gap,
+                ):
                     segments.append(
                         {
-                            "id": f"{item['id']}_{seg['start']:.1f}",
-                            "video_path": item["video_path"],
-                            "json_path": item["json_path"],
-                            "start_sec": seg["start"],
-                            "end_sec": seg["end"],
-                            "text": seg["text"],
+                            "id": f"{item['id']}_{w['start_sec']:.2f}_{w['end_sec']:.2f}",
+                            "video_path": resolve_path(item["video_path"]),
+                            "json_path": resolve_path(item["json_path"]),
+                            "start_sec": w["start_sec"],
+                            "end_sec": w["end_sec"],
+                            "text": w["text"],
+                            "n_segments": w["n_segments"],
                         }
                     )
         return segments

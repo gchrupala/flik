@@ -56,6 +56,7 @@ STAGES = [
             + (["--num-workers", str(cfg.num_workers)] if cfg.num_workers else [])
             + (["--decoder", cfg.decoder] if cfg.decoder else [])
             + (["--no-fp16"] if cfg.no_fp16 else [])
+            + (["--seed", str(cfg.seed)] if cfg.seed is not None else [])
         ),
         "inputs": [OUTPUT_MANIFEST],
         "outputs": [ALIGNMENT_SCORES_FILE.replace(".json", "_randomized.json")],
@@ -72,6 +73,7 @@ STAGES = [
             + (["--num-workers", str(cfg.num_workers)] if cfg.num_workers else [])
             + (["--decoder", cfg.decoder] if cfg.decoder else [])
             + (["--no-fp16"] if cfg.no_fp16 else [])
+            + (["--seed", str(cfg.seed)] if cfg.seed is not None else [])
         ),
         "inputs": [
             OUTPUT_MANIFEST,
@@ -255,6 +257,12 @@ def main():
         "--no-fp16",
         action="store_true",
         help="Disable FP16 autocast on CUDA (use FP32)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for CLIP sampling/null baseline (default: 42 in check_correspondance)",
     )
     parser.add_argument(
         "--percentile-threshold",

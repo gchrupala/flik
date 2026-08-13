@@ -3,9 +3,22 @@ import os
 
 # Config
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Check if we're running on snellius and set paths accordingly
-hostname = os.uname().nodename
-if "snellius" in hostname:
+
+# Data root: explicit override wins, hostname detection is the fallback.
+# FLIK_DATA_ROOT should point at the folder that holds the cinedantan data.
+#   - Standard (split) layout: <root>/transcripts + <root>/videos  (local devbox)
+#   - Flat layout: transcripts and videos both directly under <root> (Snellius data/out)
+# If unset, we fall back to the old hostname heuristic (node short names like
+# gcn*/int* do NOT contain "snellius", so set FLIK_DATA_ROOT on the cluster).
+_DATA_ROOT = os.environ.get("FLIK_DATA_ROOT")
+if _DATA_ROOT:
+    if os.path.isdir(os.path.join(_DATA_ROOT, "transcripts")):
+        TRANSCRIPT_ROOT = os.path.join(_DATA_ROOT, "transcripts")
+        VIDEO_ROOT = os.path.join(_DATA_ROOT, "videos")
+    else:
+        TRANSCRIPT_ROOT = _DATA_ROOT
+        VIDEO_ROOT = _DATA_ROOT
+elif "snellius" in os.uname().nodename:
     TRANSCRIPT_ROOT = os.path.join(PROJECT_ROOT, "data/out")
     VIDEO_ROOT = os.path.join(PROJECT_ROOT, "data/out")
 else:
@@ -66,9 +79,11 @@ def calculate_total_duration(json_path: str = OUTPUT_MANIFEST) -> None:
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    from src.utils.paths import resolve_path
+
     total_duration = 0.0
     for item in data:
-        json_file = item.get("json_path")
+        json_file = resolve_path(item.get("json_path", ""))
         if json_file and os.path.isfile(json_file):
             with open(json_file, "r", encoding="utf-8") as jf:
                 segments = json.load(jf)
@@ -91,9 +106,11 @@ def calculate_total_size(json_path: str = OUTPUT_MANIFEST) -> None:
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    from src.utils.paths import resolve_path
+
     total_size_bytes = 0
     for item in data:
-        video_file = item.get("video_path")
+        video_file = resolve_path(item.get("video_path", ""))
         if video_file and os.path.isfile(video_file):
             total_size_bytes += os.path.getsize(video_file)
 

@@ -33,6 +33,9 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _project_root)
 
 from src.CONSTANTS import PROJECT_ROOT
+from src.utils.paths import resolve_path
+from src.utils.segments import merge_segments
+from src.utils.validation import validate_segment
 
 
 # ---------------------------------------------------------------------------
@@ -66,59 +69,6 @@ def setup_logging():
 
 
 # ---------------------------------------------------------------------------
-# Fallback validate_segment (imported by preference)
-# ---------------------------------------------------------------------------
-
-def _fallback_validate_segment(seg: dict, num_frames: int = 16, sample_rate: int = 16000) -> tuple:
-    """
-    Try to load a single segment's video and audio.
-    Copied verbatim from scripts/validate_manifest.py (lines 43-69).
-
-    Returns (segment_id, success, error_message).
-    """
-    from src.utils.video import video_to_tensor
-    from src.utils.audio import audio_to_tensor
-
-    seg_id = seg.get("id", f"{seg.get('video_path', '?')}_{seg['start_sec']:.1f}")
-    try:
-        video = video_to_tensor(
-            seg["video_path"],
-            seg["start_sec"],
-            seg["end_sec"],
-            num_frames=num_frames,
-        )
-        audio = audio_to_tensor(
-            seg["video_path"],
-            seg["start_sec"],
-            seg["end_sec"],
-            sample_rate=sample_rate,
-        )
-        # Basic sanity checks
-        if video.shape[0] != num_frames:
-            return (seg_id, False, f"Wrong frame count: {video.shape[0]}")
-        if audio.shape[1] < sample_rate:  # less than 1 second
-            return (seg_id, False, f"Audio too short: {audio.shape[1]} samples")
-        return (seg_id, True, None)
-    except Exception as e:
-        return (seg_id, False, str(e))
-
-
-def _get_validate_segment():
-    """Return the validate_segment function (imported or fallback).
-
-    Tries to import from the sibling ``scripts/validate_manifest.py`` at
-    call time (lazy import) so that ``--validate`` runs without
-    triggering the torchvision import chain. Falls back to a local copy
-    if the import fails for ANY reason (not just ImportError).
-    """
-    try:
-        from scripts.validate_manifest import validate_segment
-        return validate_segment
-    except Exception:
-        return _fallback_validate_segment
-
-
-# ---------------------------------------------------------------------------
 # Expansion
 # ---------------------------------------------------------------------------
 
@@ -126,6 +76,7 @@ def expand_segments(
     manifest_path: str,
     min_duration: float,
     max_duration: float,
+    max_gap: float,
     logger: logging.Logger,
 ) -> list:
     """
@@ -133,8 +84,11 @@ def expand_segments(
 
     For each video in the input manifest:
       - Load the transcript JSON from item["json_path"]
-      - For each transcript segment, apply the duration filter
-      - Build segment dicts matching the train dataset format
+      - Merge consecutive transcript segments into [min, max] windows
+        (breaks on gaps > max_gap and on max-length overflow), which rescues
+        the sub-minimum utterance fragments Whisper produces in dialogue
+        - Build segment dicts matching the train dataset format, tagging each
+        window with its constituent segment count (n_segments)
 
     Returns (segments, n_videos, n_transcript_segments, n_kept).
     """
@@ -154,10 +108,11 @@ def expand_segments(
 
     for item in videos:
         video_id = item.get("id", "unknown")
-        json_path = item.get("json_path", "")
+        json_path_stored = item.get("json_path", "")
+        json_path = resolve_path(json_path_stored)
 
         if not json_path or not os.path.exists(json_path):
-            logger.warning(f"Missing transcript JSON for {video_id}: {json_path}")
+            logger.warning(f"Missing transcript JSON for {video_id}: {json_path_stored}")
             continue
 
         try:
@@ -171,35 +126,39 @@ def expand_segments(
         total_transcript_segments += n_total
         n_kept = 0
 
-        for seg in transcript:
-            start = seg.get("start", 0.0)
-            end = seg.get("end", 0.0)
-            dur = end - start
+        windows = merge_segments(
+            transcript,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            max_gap=max_gap,
+        )
 
-            # Duration filter — mirrors VideoAudioDataset._build_segment_list()
-            if dur < min_duration or dur > max_duration:
-                continue
-
-            segment_id = f"{video_id}_{start:.1f}"
+        for w in windows:
+            # Include end time + finer precision to avoid 0.1s-rounding collisions
+            # between windows that start within ~0.05s of each other.
+            segment_id = f"{video_id}_{w['start_sec']:.2f}_{w['end_sec']:.2f}"
             all_segments.append({
                 "id": segment_id,
                 "video_id": video_id,
-                "video_path": item["video_path"],
-                "json_path": json_path,
-                "start_sec": start,
-                "end_sec": end,
-                "text": seg.get("text", ""),
+                "video_path": item["video_path"],  # kept as stored (relative) for portability
+                "json_path": json_path_stored,
+                "start_sec": w["start_sec"],
+                "end_sec": w["end_sec"],
+                "text": w["text"],
+                "n_segments": w["n_segments"],
             })
             n_kept += 1
 
         total_kept += n_kept
         logger.info(
-            f"Expanded {video_id}: {n_kept}/{n_total} segments pass duration filter"
+            f"Expanded {video_id}: {n_kept} windows from {n_total} transcript "
+            f"segments (merged with gap threshold {max_gap}s)"
         )
 
     logger.info(
-        f"Expansion complete: {total_kept}/{total_transcript_segments} "
-        f"segments kept ({100*total_kept/total_transcript_segments:.1f}%)"
+        f"Expansion complete: {total_kept} training windows from "
+        f"{total_transcript_segments} transcript segments "
+        f"({100*total_kept/total_transcript_segments:.1f}%)"
     )
 
     return all_segments, len(videos), total_transcript_segments, total_kept
@@ -221,7 +180,6 @@ def validate_segments(
 
     Returns (valid_segments, failed_list).
     """
-    validate_fn = _get_validate_segment()
     valid_segments = []
     failed = []
 
@@ -236,7 +194,7 @@ def validate_segments(
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {
-            executor.submit(validate_fn, seg, num_frames, sample_rate): seg
+            executor.submit(validate_segment, seg, num_frames, sample_rate): seg
             for seg in segments
         }
 
@@ -338,6 +296,14 @@ Examples:
         help="Maximum segment duration in seconds (default: 10.0)",
     )
     parser.add_argument(
+        "--max-gap",
+        type=float,
+        default=1.0,
+        help="Max allowed gap (s) between merged consecutive segments; larger "
+             "gaps break the window (scene change / music / silence). "
+             "(default: 1.0)",
+    )
+    parser.add_argument(
         "--num-frames",
         type=int,
         default=16,
@@ -385,7 +351,7 @@ Examples:
     output_path = os.path.join(PROJECT_ROOT, args.output)
 
     segments, n_videos, n_transcript, n_dur = expand_segments(
-        input_path, args.min_duration, args.max_duration, logger
+        input_path, args.min_duration, args.max_duration, args.max_gap, logger
     )
 
     if not segments:

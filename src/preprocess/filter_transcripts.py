@@ -14,6 +14,7 @@ from src.CONSTANTS import (
     VIDEO_ROOT,
     VIDEO_EXTENSIONS,
 )
+from src.utils.paths import to_relative
 
 # Set up logging
 logging.basicConfig(
@@ -25,6 +26,40 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+
+def _build_video_index() -> dict:
+    """One-time index of every video file under VIDEO_ROOT, keyed by basename.
+
+    Walk VIDEO_ROOT once (instead of re-walking a directory for every SRT),
+    turning the per-SRT O(N*M) lookup into an O(N+M) dict lookup.
+    """
+    index: dict = {}
+    for root, _, files in os.walk(VIDEO_ROOT):
+        for fname in files:
+            if fname.endswith(VIDEO_EXTENSIONS):
+                base = os.path.splitext(fname)[0]
+                index.setdefault(base, []).append(os.path.join(root, fname))
+    return index
+
+
+def _find_video(base_name: str, json_path: str, video_index: dict):
+    """Return the video path for a transcript, or None if not found.
+
+    Prefers the video in the subdir mapped from the transcript's location
+    (mirrors the old per-SRT tree-walk behavior); falls back to any match when
+    the mapped dir has no hit.
+    """
+    candidates = video_index.get(base_name, [])
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    video_dir = os.path.dirname(json_path.replace(TRANSCRIPT_ROOT, VIDEO_ROOT))
+    for vp in candidates:
+        if os.path.dirname(vp) == video_dir:
+            return vp
+    return candidates[0]
 
 
 def check_transcript_language(srt_path: str) -> bool:
@@ -67,6 +102,10 @@ def main():
 
     logger.info(f"Found {len(all_srt_files)} SRT files. Processing...")
 
+    # Pre-index all videos once (avoids re-walking the video tree per SRT).
+    video_index = _build_video_index()
+    logger.info(f"Indexed {sum(len(v) for v in video_index.values())} video files.")
+
     for srt_file in tqdm(all_srt_files, desc="Processing SRTs"):
         # First check the Whisperx language ID output to see if the transcript is English
         if not check_transcript_language(srt_file):
@@ -80,28 +119,23 @@ def main():
         json_path = srt_file.replace(".srt", ".json")
 
         if os.path.isfile(json_path):
-            video_dir = os.path.dirname(json_path.replace(TRANSCRIPT_ROOT, VIDEO_ROOT))
-            if os.path.isdir(video_dir):
-                for root, _, files in os.walk(video_dir):
-                    for file in files:
-                        if file.rsplit(".", 1)[0] == base_name and file.endswith(
-                            VIDEO_EXTENSIONS
-                        ):
-                            video_path = os.path.join(root, file)
+            video_path = _find_video(base_name, json_path, video_index)
 
-                            valid_pairs.append(
-                                {
-                                    "id": base_name,
-                                    "video_path": video_path,
-                                    "json_path": json_path,  # We pass the JSON to the next step
-                                    "srt_path": srt_file,  # Kept for reference
-                                }
-                            )
-                            break
-
-            else:
+            if video_path is None:
                 logger.warning(f"Skipping {base_name}: Video not found.")
                 skipped_reason["video_not_found"] += 1
+                continue
+
+            # Store paths relative to PROJECT_ROOT so the manifest stays valid
+            # across machines.
+            valid_pairs.append(
+                {
+                    "id": base_name,
+                    "video_path": to_relative(video_path),
+                    "json_path": to_relative(json_path),  # We pass the JSON to the next step
+                    "srt_path": to_relative(srt_file),  # Kept for reference
+                }
+            )
         else:
             logger.warning(f"Skipping {base_name}: Found SRT but missing JSON.")
             skipped_reason["missing_json"] += 1
