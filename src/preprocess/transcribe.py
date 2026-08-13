@@ -111,6 +111,20 @@ def main():
         default=DEVICE,
         help=f"Device to use for inference (default: {DEVICE})",
     )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="This shard's index (0-based). Use with --num-shards for SLURM "
+        "array jobs. Default 0 = no sharding.",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Total number of shards (SLURM array size). Default 1 = no "
+        "sharding (process all videos).",
+    )
     args = parser.parse_args()
 
     device = args.device
@@ -144,11 +158,31 @@ def main():
         pattern = os.path.join(SOURCE_FOLDER, "**", f"*{ext.upper()}")
         files_to_process.extend(glob.glob(pattern, recursive=True))
 
+    # Deterministic order is REQUIRED for SLURM array sharding: every array
+    # task must see the same list so that (index % num_tasks) assigns each
+    # video to exactly one task.
+    files_to_process = sorted(set(files_to_process))
+
     logger.info(f"Found {len(files_to_process)} video files to process.")
 
     if not files_to_process:
         logger.info("No video files found.")
         return
+
+    # --- SLURM array sharding (optional) ---
+    # --shard-index i --num-shards N -> process videos[i], videos[i+N], ...
+    # Defaults (0 / 1) reproduce the original single-process behavior.
+    shard_index = args.shard_index
+    num_shards = args.num_shards
+    if num_shards > 1:
+        if not (0 <= shard_index < num_shards):
+            raise ValueError(
+                f"--shard-index must be in [0, {num_shards}), got {shard_index}"
+            )
+        files_to_process = files_to_process[shard_index::num_shards]
+        logger.info(
+            f"Shard {shard_index}/{num_shards}: processing {len(files_to_process)} videos"
+        )
 
     # 3. Load Alignment Model (English usually, or detect automatically)
     # Note: If your movies are mixed languages, you might need to handle language code dynamically per file.

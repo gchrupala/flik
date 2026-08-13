@@ -6,10 +6,23 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Data root: explicit override wins, hostname detection is the fallback.
 # FLIK_DATA_ROOT should point at the folder that holds the cinedantan data.
-#   - Standard (split) layout: <root>/transcripts + <root>/videos  (local devbox)
-#   - Flat layout: transcripts and videos both directly under <root> (Snellius data/out)
-# If unset, we fall back to the old hostname heuristic (node short names like
-# gcn*/int* do NOT contain "snellius", so set FLIK_DATA_ROOT on the cluster).
+#   - Split layout: <root>/transcripts + <root>/videos  (detected when
+#     <root>/transcripts exists; videos are then assumed under <root>/videos)
+#   - Flat layout:  transcripts and videos both directly under <root>
+#
+# Snellius (project prjs1586): videos persist in project space and are
+# symlinked into the repo; transcripts/manifests are small and live in-repo.
+# The cluster uses the split layout via a symlink pair:
+#     data/transcripts/                  (in-repo, small)
+#     data/videos  -> /projects/prjs1586/cinedantan_videos   (project space)
+#     data/out     -> /projects/prjs1586/cinedantan_videos   (legacy alias)
+# and FLIK_DATA_ROOT is set to the repo's data/ dir:
+#     ln -sfn /projects/prjs1586/cinedantan_videos data/videos
+#     export FLIK_DATA_ROOT="$PWD/data"
+# Split detection then finds data/transcripts and resolves videos to
+# data/videos (project space). Set FLIK_DATA_ROOT in every job script:
+# compute/login node hostnames (gcn*/int*) do NOT contain "snellius", so the
+# hostname heuristic below never fires there.
 _DATA_ROOT = os.environ.get("FLIK_DATA_ROOT")
 if _DATA_ROOT:
     if os.path.isdir(os.path.join(_DATA_ROOT, "transcripts")):
@@ -36,7 +49,7 @@ CHAR_SAMPLE_SIZE = 2000
 
 # Transcription (WhisperX) constants
 WHISPER_DEVICE = "cuda"  # Default device; scripts dynamically detect CUDA availability
-WHISPER_BATCH_SIZE = 16
+WHISPER_BATCH_SIZE = 48  # raised from 16: large-v3 uses ~6GB VRAM, 40GB headroom
 WHISPER_COMPUTE_TYPE = "float16"
 WHISPER_MODEL = "large-v3"
 ALIGNMENT_LANGUAGE = "en"
