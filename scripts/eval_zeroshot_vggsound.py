@@ -13,6 +13,11 @@ Per clip:
     computed in FP32 under ``torch.no_grad()`` (no autocast — matches the
     verified eval-side precision used during training).
 
+Clip decoding is CPU-bound and is parallelized across processes with
+``--workers`` (default 4). Decoded clips are consumed in manifest order, so
+``--workers 1`` (in-process sequential decode) and ``--workers N`` produce
+identical results.
+
 Metrics over ALL successfully decoded clips:
   * paired retrieval R@1/5/10 (a2v and v2a) via ``retrieval_recall_at_k``
   * median rank (1-based) for a2v and v2a
@@ -32,6 +37,7 @@ Usage:
 """
 
 import argparse
+import collections
 import json
 import logging
 import os
@@ -222,6 +228,79 @@ def _decode_clip(clip, num_frames, sample_rate, start_sec, end_sec):
     return audio, video
 
 
+def _decode_clip_worker(index, clip, num_frames, sample_rate, start_sec, end_sec):
+    """Decode one clip in a worker process and capture its error.
+
+    Top-level so ProcessPoolExecutor can pickle it. Returns
+    ``(index, audio, video, error)``; ``audio`` and ``video`` are None when
+    decoding fails.
+    """
+    try:
+        audio, video = _decode_clip(
+            clip, num_frames, sample_rate, start_sec, end_sec)
+        return index, audio, video, None
+    except Exception as e:
+        return index, None, None, str(e)
+
+
+# Batches decoded ahead of the encode loop when --workers > 1. Each decoded
+# clip is ~10 MB (16 frames 224x224 fp32 + 10 s audio), so three batches keep
+# peak decode memory in the low GB range.
+_DECODE_PREFETCH_BATCHES = 3
+
+
+def _iter_decoded_batches(clips, batch_size, workers, num_frames, sample_rate,
+                          start_sec, end_sec):
+    """Yield decoded batches in manifest order.
+
+    Each batch is a list of ``(index, audio, video, error)`` tuples. With
+    ``workers <= 1`` decoding runs in-process, which is the plain sequential
+    path. With ``workers > 1`` a ProcessPoolExecutor decodes clips and at most
+    ``_DECODE_PREFETCH_BATCHES`` batches are in flight, so decoded tensors do
+    not accumulate without limit.
+    """
+    starts = range(0, len(clips), batch_size)
+
+    if workers <= 1:
+        for start in starts:
+            yield [
+                _decode_clip_worker(i, clips[i], num_frames, sample_rate,
+                                    start_sec, end_sec)
+                for i in range(start, min(start + batch_size, len(clips)))
+            ]
+        return
+
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+
+    # Use "spawn", not the Linux default "fork". The parent has already built
+    # the model, so forking it while torch/OpenMP threads are live deadlocks the
+    # worker's first decode. Spawn starts clean interpreter processes.
+    mp_context = multiprocessing.get_context("spawn")
+    window = max(workers, _DECODE_PREFETCH_BATCHES * batch_size)
+    with ProcessPoolExecutor(max_workers=workers,
+                             mp_context=mp_context) as executor:
+        pending = collections.deque()
+
+        def _submit(i):
+            return executor.submit(_decode_clip_worker, i, clips[i],
+                                   num_frames, sample_rate, start_sec, end_sec)
+
+        next_index = 0
+        while next_index < len(clips) and len(pending) < window:
+            pending.append(_submit(next_index))
+            next_index += 1
+
+        for start in starts:
+            batch = []
+            for _ in range(start, min(start + batch_size, len(clips))):
+                batch.append(pending.popleft().result())
+                if next_index < len(clips):
+                    pending.append(_submit(next_index))
+                    next_index += 1
+            yield batch
+
+
 def _pad_audio(audio_list):
     """Pad a list of (1, T) waveforms; return (B,1,T_max) and mask (padded=True)."""
     max_len = max(a.shape[1] for a in audio_list)
@@ -285,7 +364,7 @@ def compute_metrics(audio_embs, video_embs, labels, ks=(1, 5, 10)):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(models, clips, device, batch_size, num_frames, sample_rate,
+def evaluate(models, clips, device, batch_size, workers, num_frames, sample_rate,
              start_sec, end_sec, logger):
     """Encode all clips for every model and return {name: metrics} + failures."""
     names = list(models.keys())
@@ -296,18 +375,18 @@ def evaluate(models, clips, device, batch_size, num_frames, sample_rate,
     used = 0
     t0 = time.time()
 
-    for start in range(0, len(clips), batch_size):
-        batch = clips[start:start + batch_size]
+    for decoded in _iter_decoded_batches(
+            clips, batch_size, workers, num_frames, sample_rate,
+            start_sec, end_sec):
         audio_list, video_list = [], []
-        for c in batch:
-            try:
-                a, v = _decode_clip(c, num_frames, sample_rate, start_sec, end_sec)
-            except Exception as e:
-                failures.append({"video_id": c["video_id"], "error": str(e)})
+        for index, a, v, error in decoded:
+            if error is not None:
+                failures.append(
+                    {"video_id": clips[index]["video_id"], "error": error})
                 continue
             audio_list.append(a)
             video_list.append(v)
-            labels.append(c["label"])
+            labels.append(clips[index]["label"])
 
         if not audio_list:
             continue
@@ -379,6 +458,9 @@ def parse_args(argv=None):
                    default="data/vggsound_subset/clips_manifest.json",
                    help="Clips manifest from download_vggsound_subset.py.")
     p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--workers", type=int, default=4,
+                   help="Parallel decode processes (default 4). Use 1 to "
+                        "decode in-process, sequentially.")
     p.add_argument("--device", type=str, default=None,
                    help="cuda|cpu (default: cuda if available).")
     p.add_argument("--out", type=str, default="zeroshot_results.json",
@@ -450,9 +532,10 @@ def main(argv=None):
     ks = tuple(cfg.validation.get("retrieval_top_k", [1, 5, 10]))
     logger.info(f"Evaluating {len(models)} model(s) on {len(clips)} clips "
                 f"(window [{args.start_sec}, {args.end_sec}]s, "
-                f"batch_size={args.batch_size}, ks={list(ks)})")
+                f"batch_size={args.batch_size}, workers={args.workers}, "
+                f"ks={list(ks)})")
     results, failures, used = evaluate(
-        models, clips, device, args.batch_size, args.num_frames,
+        models, clips, device, args.batch_size, args.workers, args.num_frames,
         args.sample_rate, args.start_sec, args.end_sec, logger,
     )
 
