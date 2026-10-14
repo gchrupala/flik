@@ -296,8 +296,13 @@ def compute_vad(waveform, sample_rate):
     return voiced_frac, float(dbfs.mean())
 
 
-def analyze_segment(seg):
-    """Decode one window and compute QC metrics. Never raises."""
+def analyze_segment(seg, align_to_start: bool = True):
+    """Decode one window and compute QC metrics. Never raises.
+
+    ``align_to_start`` is forwarded to ``audio_to_tensor`` so the voiced /
+    energy metrics describe the requested ``[start_sec, end_sec)`` window.
+    ``False`` keeps the historical keyframe pre-roll (runs before 2026-09-16).
+    """
     start = float(seg.get("start_sec", 0.0))
     end = float(seg.get("end_sec", 0.0))
     text = seg.get("text", "") or ""
@@ -320,7 +325,8 @@ def analyze_segment(seg):
     try:
         video_path = resolve_path(seg.get("video_path", ""))
         video = video_to_tensor(video_path, start, end, num_frames=NUM_FRAMES)
-        audio = audio_to_tensor(video_path, start, end, sample_rate=SAMPLE_RATE)
+        audio = audio_to_tensor(video_path, start, end, sample_rate=SAMPLE_RATE,
+                                align_to_start=align_to_start)
     except Exception as exc:  # noqa: BLE001 - bad media must not kill the run
         row["status"] = f"error: {exc}"
         row["flags"] = ["decode_fail"]
@@ -510,6 +516,15 @@ def parse_args():
         action="store_true",
         help="Skip Phase 1 manifest-wide statistics",
     )
+    parser.add_argument(
+        "--audio-align-to-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Trim the audio windows to start_sec by decoded PTS (default: "
+        "true; matches dataset.audio_align_to_start). "
+        "--no-audio-align-to-start keeps the historical keyframe pre-roll "
+        "(runs logged before 2026-09-16).",
+    )
     return parser.parse_args()
 
 
@@ -522,6 +537,14 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     logger.info("Manifest: %s", manifest_path)
+    logger.info(
+        "Audio window alignment: "
+        + (
+            "timestamp-accurate, starts at start_sec (audio_align_to_start=true)"
+            if args.audio_align_to_start
+            else "legacy keyframe pre-roll retained (audio_align_to_start=false, bug-compatible)"
+        )
+    )
     manifest = load_manifest(manifest_path)
     logger.info("Loaded %d windows", len(manifest))
 
@@ -540,7 +563,7 @@ def main():
     rows = [None] * len(sampled)
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
-            executor.submit(analyze_segment, seg): idx
+            executor.submit(analyze_segment, seg, args.audio_align_to_start): idx
             for idx, seg in enumerate(sampled)
         }
         done = 0

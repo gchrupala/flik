@@ -8,6 +8,7 @@ def _load_audio_segment(
     start_sec: float,
     end_sec: float,
     target_sample_rate: int = 16000,
+    align_to_start: bool = False,
 ) -> torch.Tensor:
     """
     Load audio segment using PyAV (ffmpeg bindings).
@@ -17,6 +18,24 @@ def _load_audio_segment(
 
     Tolerant of corrupt frames: if decoding fails partway through, returns
     whatever samples were collected so far (padded to target length).
+
+    Note:
+        ``align_to_start=False`` (default) keeps the historical behaviour:
+        the container is seeked to the previous keyframe, every decoded
+        sample is concatenated, and the buffer is trimmed from the FRONT to
+        ``num_samples``. The pre-roll between the keyframe and ``start_sec``
+        is therefore retained and the returned window starts early by the
+        keyframe distance (measured 0.07-8.0 s on the local films; the gap is
+        the video keyframe spacing).
+
+        ``align_to_start=True`` opts in to timestamp-accurate trimming: the
+        first decoded frame's PTS defines sample 0 of the buffer, and the
+        pre-roll is dropped so the window starts at ``start_sec``. Callers
+        must opt in explicitly so default training behaviour is unchanged.
+
+        Run mapping: runs logged before 2026-09-16 used
+        ``align_to_start=False`` (the buggy behaviour). Training and
+        validation now pass ``dataset.audio_align_to_start`` (default true).
     """
     import av
 
@@ -43,6 +62,7 @@ def _load_audio_segment(
     container.seek(int(start_sec * av.time_base))
 
     samples_list = []
+    base_pts_sec = None  # PTS of the first frame that contributed samples
     try:
         for frame in container.decode(audio_stream):
             frame_pts_sec = float(frame.pts * audio_stream.time_base)
@@ -51,6 +71,8 @@ def _load_audio_segment(
             try:
                 for resampled in resampler.resample(frame):
                     arr = resampled.to_ndarray().ravel()
+                    if base_pts_sec is None:
+                        base_pts_sec = frame_pts_sec
                     samples_list.append(arr)
             except Exception:
                 # Skip corrupt frame, continue with next
@@ -75,6 +97,17 @@ def _load_audio_segment(
     else:
         all_samples = np.zeros(0, dtype=np.int16)
 
+    # Opt-in: drop the keyframe pre-roll by decoded timestamps. Sample 0 of the
+    # buffer is base_pts_sec, so start_sec is `skip` samples into the buffer.
+    if align_to_start and base_pts_sec is not None:
+        skip = int(round((start_sec - base_pts_sec) * target_sample_rate))
+        if skip >= 0:
+            all_samples = all_samples[skip:]
+        else:
+            all_samples = np.concatenate(
+                [np.zeros(-skip, dtype=all_samples.dtype), all_samples]
+            )
+
     # Trim/pad to exact length
     if len(all_samples) > num_samples:
         all_samples = all_samples[:num_samples]
@@ -95,8 +128,12 @@ def load_audio_from_video(
     start_sec: float,
     end_sec: float,
     target_sample_rate: int = 16000,
+    align_to_start: bool = False,
 ) -> torch.Tensor:
-    return _load_audio_segment(video_path, start_sec, end_sec, target_sample_rate)
+    return _load_audio_segment(
+        video_path, start_sec, end_sec, target_sample_rate,
+        align_to_start=align_to_start,
+    )
 
 
 def load_audio_from_wav(
@@ -104,8 +141,12 @@ def load_audio_from_wav(
     start_sec: float,
     end_sec: float,
     target_sample_rate: int = 16000,
+    align_to_start: bool = False,
 ) -> torch.Tensor:
-    return _load_audio_segment(wav_path, start_sec, end_sec, target_sample_rate)
+    return _load_audio_segment(
+        wav_path, start_sec, end_sec, target_sample_rate,
+        align_to_start=align_to_start,
+    )
 
 
 def audio_to_tensor(
@@ -113,11 +154,18 @@ def audio_to_tensor(
     start_sec: float,
     end_sec: float,
     sample_rate: int = 16000,
+    align_to_start: bool = False,
 ) -> torch.Tensor:
     """
     Generic audio loading from video or audio files via PyAV.
+
+    Set ``align_to_start=True`` for timestamp-accurate windows (drops the
+    keyframe pre-roll). Default ``False`` preserves historical behaviour.
     """
-    return _load_audio_segment(audio_path, start_sec, end_sec, sample_rate)
+    return _load_audio_segment(
+        audio_path, start_sec, end_sec, sample_rate,
+        align_to_start=align_to_start,
+    )
 
 
 if __name__ == "__main__":

@@ -174,9 +174,14 @@ def validate_segments(
     sample_rate: int,
     num_workers: int,
     logger: logging.Logger,
+    align_to_start: bool = True,
 ) -> tuple:
     """
     Validate every segment by actually decoding video+audio.
+
+    ``align_to_start`` is forwarded to ``validate_segment`` and controls the
+    audio window offset (True = start at start_sec; False = legacy keyframe
+    pre-roll, runs logged before 2026-09-16).
 
     Returns (valid_segments, failed_list).
     """
@@ -194,7 +199,9 @@ def validate_segments(
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {
-            executor.submit(validate_segment, seg, num_frames, sample_rate): seg
+            executor.submit(
+                validate_segment, seg, num_frames, sample_rate, align_to_start
+            ): seg
             for seg in segments
         }
 
@@ -328,6 +335,14 @@ Examples:
         "the dataset's runtime retry logic (3 attempts with random fallback) "
         "handles corrupt segments during training.",
     )
+    parser.add_argument(
+        "--audio-align-to-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Validation-only: trim the audio window to start_sec by decoded "
+        "PTS (default: true). --no-audio-align-to-start keeps the historical "
+        "keyframe pre-roll (runs logged before 2026-09-16).",
+    )
     args = parser.parse_args()
 
     # Setup logging
@@ -343,6 +358,14 @@ Examples:
         logger.info(f"  num_frames:        {args.num_frames}")
         logger.info(f"  sample_rate:       {args.sample_rate}")
         logger.info(f"  num_workers:       {args.num_workers}")
+        logger.info(
+            "  Audio alignment:   "
+            + (
+                "start_sec (audio_align_to_start=true)"
+                if args.audio_align_to_start
+                else "legacy keyframe pre-roll (audio_align_to_start=false)"
+            )
+        )
 
     t_start = time.time()
 
@@ -363,7 +386,12 @@ Examples:
     validated = args.validate
     if validated:
         valid_segments, failed, val_elapsed, n_val_total = validate_segments(
-            segments, args.num_frames, args.sample_rate, args.num_workers, logger
+            segments,
+            args.num_frames,
+            args.sample_rate,
+            args.num_workers,
+            logger,
+            args.audio_align_to_start,
         )
         n_failed = len(failed)
 

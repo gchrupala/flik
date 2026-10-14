@@ -75,6 +75,15 @@ def main():
         default=16,
         help="Number of parallel workers (default: 16)",
     )
+    parser.add_argument(
+        "--audio-align-to-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Trim the audio window to start_sec by decoded PTS (default: true). "
+        "--no-audio-align-to-start keeps the historical keyframe pre-roll "
+        "(windows start early by the keyframe gap; use only to reproduce "
+        "runs logged before 2026-09-16).",
+    )
     args = parser.parse_args()
 
     # Determine output path
@@ -93,6 +102,14 @@ def main():
     logger.info(f"Validating {len(segments)} segments from {args.input}")
     logger.info(f"  Workers: {args.num_workers}")
     logger.info(f"  Output: {args.output}")
+    logger.info(
+        "  Audio window alignment: "
+        + (
+            "start_sec (audio_align_to_start=true)"
+            if args.audio_align_to_start
+            else "legacy keyframe pre-roll retained (audio_align_to_start=false)"
+        )
+    )
 
     # Validate in parallel
     valid_segments = []
@@ -104,7 +121,11 @@ def main():
     with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
         futures = {
             executor.submit(
-                validate_segment, seg, args.num_frames, args.sample_rate
+                validate_segment,
+                seg,
+                args.num_frames,
+                args.sample_rate,
+                args.audio_align_to_start,
             ): seg
             for seg in segments
         }

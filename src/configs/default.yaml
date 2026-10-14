@@ -29,6 +29,16 @@ dataset:
   min_duration: 3.0
   max_duration: 10.0
   dummy: false  # set to true for testing
+  val_manifest_path: null  # frozen validation pool manifest (e.g. data/val_pool.json); null = runtime split
+  dedup_report_path: null  # movie-level dedup report for grouping hold-outs (e.g. data/dedup_report.json); null = group by video_id
+  # Audio window alignment. The historical default (false) is a BUG, not a
+  # feature: _load_audio_segment seeks to the previous video keyframe and trims
+  # the pre-roll from the FRONT, so every audio window started early by the
+  # keyframe gap (measured mean ~2.3-2.5 s, worst ~8 s on the local films).
+  # true = drop the pre-roll by decoded PTS so the window starts at start_sec.
+  # Runs logged before 2026-09-16 used the buggy path; map them to
+  # audio_align_to_start: false when comparing against old checkpoints/logs.
+  audio_align_to_start: true
 
 # DataLoader
 dataloader:

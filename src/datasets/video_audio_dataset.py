@@ -29,6 +29,7 @@ class VideoAudioDataset(Dataset):
         max_gap: float = 1.0,
         dummy: bool = False,
         manifest_items: Optional[List[Dict[str, Any]]] = None,
+        audio_align_to_start: bool = True,
     ):
         """
         Args:
@@ -38,6 +39,11 @@ class VideoAudioDataset(Dataset):
             min_duration: Minimum segment duration in seconds.
             max_duration: Maximum segment duration in seconds.
             dummy: If True, generate random tensors (for testing).
+            audio_align_to_start: If True (default), drop the keyframe pre-roll
+                so the audio window starts at ``start_sec``. The historical
+                value was False, which returned windows shifted early by the
+                video keyframe gap (a defect; see ``src/utils/audio.py``).
+                Set False only to reproduce runs logged before 2026-09-16.
         """
         self.sample_rate = sample_rate
         self.num_frames = num_frames
@@ -45,6 +51,7 @@ class VideoAudioDataset(Dataset):
         self.max_duration = max_duration
         self.max_gap = max_gap
         self.dummy = dummy
+        self.audio_align_to_start = audio_align_to_start
 
         if manifest_items is not None:
             self.manifest = manifest_items
@@ -174,6 +181,7 @@ class VideoAudioDataset(Dataset):
                     seg["start_sec"],
                     seg["end_sec"],
                     sample_rate=self.sample_rate,
+                    align_to_start=self.audio_align_to_start,
                 )
                 return {
                     "audio": audio,
