@@ -112,4 +112,9 @@ validation:
   eval_batch_size: 16
   split_ratio: 0.1            # fraction of unique videos held out for validation (0 = no split, eval on train)
   split_seed: 42              # deterministic seed for the video-level split
-  select_metric: "mean_r1"    # checkpoint-selection metric: mean of (a2v_r@1 + v2a_r@1)/2
+  select_metric: "mean_r1"    # checkpoint-selection metric: mean_r1 (legacy default) or hits5_sum (frozen protocol)
+  # --- Frozen-pool selection (opt-in; defaults preserve legacy behaviour) ---
+  enable_frozen_selection: false  # true = gate checkpoint_best on hits5_sum + 2*sigma and pick the trailing-3 winner
+  min_improve_sigma: 2.0          # live update requires hits5_sum > best + min_improve_sigma * sigma
+  history_path: null              # per-epoch metric/hit-vector history JSON; null = <checkpoint_dir>/val_history.json
+  dump_embeddings: false          # true = save validation embeddings per eval (large)

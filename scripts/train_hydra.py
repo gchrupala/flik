@@ -17,6 +17,7 @@ import os
 import math
 import json
 import random
+import hashlib
 from datetime import timedelta
 
 import numpy as np
@@ -40,7 +41,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -54,7 +55,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.models.flik_model import FlikModel
 from src.models.losses import CombinedLoss
 from src.datasets.video_audio_dataset import VideoAudioDataset
-from src.eval.retrieval import retrieval_recall_at_k
+from src.eval.retrieval import retrieval_metrics
 from src.utils.logging import setup_logging as flik_setup_logging, log_metrics, close_loggers
 
 
@@ -65,6 +66,100 @@ from src.utils.logging import setup_logging as flik_setup_logging, log_metrics, 
 def _is_encoder_param(name: str) -> bool:
     """Check if a parameter belongs to a pretrained encoder (wav2vec2 or videomae)."""
     return "wav2vec2" in name or "videomae" in name
+
+
+def _sha256_file(path: str) -> str:
+    """Return the hex sha256 of a file's bytes (content addressing)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _resolve_path(path: str, base: str) -> str:
+    """Resolve a possibly-relative config path against the original cwd."""
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(base, path))
+
+
+def _load_movie_key_map(path: str) -> dict:
+    """Load an ``id -> movie_key`` mapping from a dedup report.
+
+    Accepts either the full report (uses its ``id_to_movie_key`` field) or a
+    plain JSON object that is already the id -> movie_key mapping. Grouping by
+    movie_key collapses duplicate copies / multi-part items (e.g. ``VTS_01_1``,
+    ``Martha_Ivers``) into one hold-out unit so they cannot leak across
+    train/val.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "id_to_movie_key" in data:
+        mapping = data["id_to_movie_key"]
+    elif isinstance(data, dict):
+        mapping = data
+    else:
+        raise ValueError(f"{path}: expected a dedup report dict or an id->key dict")
+    if not isinstance(mapping, dict):
+        raise ValueError(f"{path}: 'id_to_movie_key' must be a dict")
+    return {str(k): str(v) for k, v in mapping.items()}
+
+
+def _group_key(item: dict, movie_key_map: dict = None) -> str:
+    """Grouping key for a manifest item (movie_key when a dedup map is given)."""
+    base = item.get("video_id") or item.get("video_path") or item.get("id") or ""
+    if movie_key_map:
+        return movie_key_map.get(base, base)
+    return base
+
+
+class StridedSampler(Sampler):
+    """Partition dataset indices across ranks exactly (no padding/duplication).
+
+    Rank ``r`` of ``world_size`` W yields indices ``r, r+W, r+2W, ...``. The
+    union of all shards equals ``range(len(dataset))`` exactly once. Shards
+    differ in size by at most one, so the eval all-gather must pad each rank's
+    local tensor to the maximum shard size and trim by per-rank counts.
+    """
+
+    def __init__(self, dataset, rank: int, world_size: int):
+        if world_size < 1:
+            raise ValueError("world_size must be >= 1")
+        if not (0 <= rank < world_size):
+            raise ValueError(f"rank {rank} out of range for world_size {world_size}")
+        self.dataset = dataset
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        n = len(self.dataset)
+        if n <= self.rank:
+            return 0
+        return (n - self.rank + self.world_size - 1) // self.world_size
+
+    def set_epoch(self, epoch: int) -> None:
+        """No-op (kept for API parity with DistributedSampler)."""
+        return None
+
+
+def _strided_gather_order(counts, world_size):
+    """Source positions that restore dataset order after a strided gather.
+
+    ``counts[r]`` is the number of local embeddings rank ``r`` contributed.
+    StridedSampler gives rank ``r`` local position ``j`` the global index
+    ``r + j*W``; to rebuild global order ``0..N-1`` we map global index ``i``
+    to rank ``i % W`` at local position ``i // W``. Returns the positional
+    index list into the rank-ordered concatenation.
+    """
+    n_pool = sum(counts)
+    prefix = [0]
+    for c in counts:
+        prefix.append(prefix[-1] + c)
+    return [prefix[i % world_size] + (i // world_size) for i in range(n_pool)]
 
 
 def _setup_distributed(timeout_min: int = 30):
@@ -230,22 +325,24 @@ def cosine_with_warmup_lambda(step: int, warmup_steps: int, total_steps: int) ->
     return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-def _split_manifest_by_video(manifest, val_ratio: float, seed: int):
+def _split_manifest_by_video(manifest, val_ratio: float, seed: int, movie_key_map: dict = None):
     """Split a segment-level manifest into (train_items, val_items) grouped by
-    video so no film appears in both splits (prevents cross-film leakage).
+    movie so no film appears in both splits (prevents cross-film leakage).
 
-    Groups segments by ``video_id`` (falling back to ``video_path``). Sorts the
-    video keys for determinism, then shuffles with ``seed`` and takes the first
-    ``ceil(n_videos * val_ratio)`` videos as the val set.
+    Groups segments by ``_group_key``: the dedup report's movie_key when
+    ``movie_key_map`` is given (so duplicate copies / multi-part ids of one film
+    stay together), else ``video_id`` (falling back to ``video_path``). Sorts
+    the keys for determinism, then shuffles with ``seed`` and takes the first
+    ``ceil(n_keys * val_ratio)`` keys as the val set.
     Returns ([...], [...]). If val_ratio <= 0, returns (manifest, []).
-    Guarantees at least 1 video in each side when val_ratio > 0 and there are
-    >= 2 videos.
+    Guarantees at least 1 key in each side when val_ratio > 0 and there are
+    >= 2 keys.
     """
     if val_ratio <= 0 or len(manifest) == 0:
         return list(manifest), []
 
     def _key(item):
-        return item.get("video_id") or item.get("video_path") or item.get("id") or ""
+        return _group_key(item, movie_key_map)
 
     groups: dict = {}
     for item in manifest:
@@ -262,6 +359,73 @@ def _split_manifest_by_video(manifest, val_ratio: float, seed: int):
     for k in video_keys:
         (val_items if k in val_keys else train_items).extend(groups[k])
     return train_items, val_items
+
+
+def _selection_metric_value(metrics, sel: str) -> float:
+    """Map a config ``select_metric`` name to a scalar from retrieval metrics.
+
+    ``mean_r1``   -- (a2v_r@1 + v2a_r@1) / 2 (legacy default)
+    ``hits5_sum`` -- a2v_hits@5 + v2a_hits@5 (frozen-pool protocol)
+    Otherwise the metric is looked up by key (0.0 when missing).
+    """
+    if sel == "mean_r1":
+        return (metrics.get("a2v_r@1", 0.0) + metrics.get("v2a_r@1", 0.0)) / 2.0
+    if sel == "hits5_sum":
+        return float(metrics.get("a2v_hits@5", 0) + metrics.get("v2a_hits@5", 0))
+    return float(metrics.get(sel, 0.0))
+
+
+def _trailing_mean(trailing, epoch: int, window: int = 3) -> float:
+    """Mean over the trailing ``window`` epochs ending at ``epoch`` (inclusive)."""
+    vals = [v for (e, v) in trailing if epoch - window < e <= epoch]
+    return sum(vals) / len(vals) if vals else float("-inf")
+
+
+def _frozen_live_accept(m, best_metric, best_epoch, n_pool, min_improve_sigma) -> bool:
+    """Frozen live-update gate: accept iff ``m > best + sigma_mult * sigma``.
+
+    ``sigma = sqrt(n*p*(1-p))`` uses the incumbent's own hits5 rate
+    ``p = best_metric / (2*n_pool)`` (hits5_sum counts both directions over
+    n_pool queries). The first accepted epoch (no incumbent) always passes.
+    """
+    if best_epoch < 0 or not math.isfinite(best_metric):
+        return True
+    p_inc = best_metric / (2.0 * n_pool) if n_pool else 0.0
+    sigma = math.sqrt(max(0.0, n_pool * p_inc * (1.0 - p_inc)))
+    return bool(m > best_metric + min_improve_sigma * sigma)
+
+
+def _append_val_history(history_path: str, epoch: int, metrics: dict) -> None:
+    """Append/replace one epoch's record in the history JSON.
+
+    Record: {"epoch", "n_pool", "metrics" (scalars), "hit_vectors" (lists)}.
+    Replacing any existing record for the same epoch keeps resume idempotent.
+    """
+    record = {
+        "epoch": int(epoch),
+        "n_pool": int(metrics.get("n_pool", 0)),
+        "metrics": {
+            k: v
+            for k, v in metrics.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        },
+        "hit_vectors": {k: v for k, v in metrics.items() if isinstance(v, list)},
+    }
+    records = []
+    if os.path.exists(history_path):
+        try:
+            with open(history_path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+            if not isinstance(records, list):
+                records = []
+        except (json.JSONDecodeError, OSError):
+            records = []
+    records = [r for r in records if r.get("epoch") != epoch]
+    records.append(record)
+    records.sort(key=lambda r: r.get("epoch", 0))
+    os.makedirs(os.path.dirname(os.path.abspath(history_path)) or ".", exist_ok=True)
+    with open(history_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, sort_keys=True)
 
 
 # ---------------------------------------------------------------------------
@@ -488,12 +652,16 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate_retrieval(cfg, model, dataloader, device, logger, tb_writer=None, wandb_run=None, step=0, is_ddp=False, val_sampler=None):
-    """Compute retrieval R@K on the validation set.
+def evaluate_retrieval(cfg, model, dataloader, device, logger, tb_writer=None, wandb_run=None, step=0, is_ddp=False, val_sampler=None, epoch=None):
+    """Compute bidirectional retrieval metrics on the validation pool.
 
-    Under DDP, each rank processes its val shard, then embeddings are
-    all-gathered. Rank 0 computes and logs the final metrics. Non-zero
-    ranks return {} (metrics are only computed on rank 0).
+    Under DDP each rank processes its val shard (a StridedSampler partitions
+    indices exactly), then embeddings are all-gathered. Shards differ in size
+    by at most one, so each rank pads its local tensor to the maximum shard
+    size with zeros, gathers, and trims by per-rank counts. Rank 0 computes
+    and logs the final metrics; non-zero ranks return {}.
+
+    Returns the full metric dict (scalars + per-query hit vectors) on rank 0.
     """
     model.eval()
     # Eval forward uses AMP when training does — ~2x faster on A100.
@@ -518,34 +686,108 @@ def evaluate_retrieval(cfg, model, dataloader, device, logger, tb_writer=None, w
 
     audio_embeddings = torch.cat(audio_embs, dim=0)  # (local_N, D)
     video_embeddings = torch.cat(video_embs, dim=0)  # (local_N, D)
+    # The pool is the full validation dataset; each rank sees the same dataset.
+    expected_n_pool = len(dataloader.dataset)
+    is_dist = is_ddp and dist.is_available() and dist.is_initialized()
 
-    # Under DDP, all-gather embeddings so rank 0 has the full validation set.
-    if is_ddp and dist.is_available() and dist.is_initialized():
-        # Use plain all_gather (no grad needed during eval)
-        gathered_audio = [torch.zeros_like(audio_embeddings) for _ in range(dist.get_world_size())]
-        gathered_video = [torch.zeros_like(video_embeddings) for _ in range(dist.get_world_size())]
-        dist.all_gather(gathered_audio, audio_embeddings)
-        dist.all_gather(gathered_video, video_embeddings)
-        audio_embeddings = torch.cat(gathered_audio, dim=0)  # (global_N, D)
-        video_embeddings = torch.cat(gathered_video, dim=0)
+    if is_dist:
+        world_size = dist.get_world_size()
+        device_ = audio_embeddings.device
+        # Gather per-rank local counts so each rank can trim the concatenation.
+        local_count = torch.tensor([audio_embeddings.shape[0]], dtype=torch.long, device=device_)
+        gathered_counts = [torch.zeros(1, dtype=torch.long, device=device_) for _ in range(world_size)]
+        dist.all_gather(gathered_counts, local_count)
+        counts = [int(t.item()) for t in gathered_counts]
+        max_n = max(counts)
 
-        # Only rank 0 computes and logs the metrics.
+        # Pad every rank's local tensor to max_n so all_gather shapes match.
+        pad = max_n - audio_embeddings.shape[0]
+        if pad > 0:
+            audio_send = torch.cat(
+                [audio_embeddings,
+                 torch.zeros(pad, audio_embeddings.shape[1], dtype=audio_embeddings.dtype, device=device_)],
+                dim=0,
+            )
+            video_send = torch.cat(
+                [video_embeddings,
+                 torch.zeros(pad, video_embeddings.shape[1], dtype=video_embeddings.dtype, device=device_)],
+                dim=0,
+            )
+        else:
+            audio_send, video_send = audio_embeddings, video_embeddings
+
+        gathered_audio = [torch.zeros_like(audio_send) for _ in range(world_size)]
+        gathered_video = [torch.zeros_like(video_send) for _ in range(world_size)]
+        dist.all_gather(gathered_audio, audio_send)
+        dist.all_gather(gathered_video, video_send)
+
+        # Trim each rank's shard to its true count, then concatenate.
+        audio_embeddings = torch.cat([gathered_audio[r][:counts[r]] for r in range(world_size)], dim=0)
+        video_embeddings = torch.cat([gathered_video[r][:counts[r]] for r in range(world_size)], dim=0)
+
+        # Gathered shards are in rank-strided order (r, r+W, ...). Reorder to
+        # dataset order so hit vectors are comparable across runs/checkpoints.
+        src_order = _strided_gather_order(counts, world_size)
+        order_idx = torch.tensor(src_order, dtype=torch.long, device=device_)
+        audio_embeddings = audio_embeddings[order_idx]
+        video_embeddings = video_embeddings[order_idx]
+
+        assert audio_embeddings.shape[0] == expected_n_pool, (
+            f"all-gather n_pool={audio_embeddings.shape[0]} != len(val_dataset)={expected_n_pool}"
+        )
         if dist.get_rank() != 0:
             return {}
+    else:
+        assert audio_embeddings.shape[0] == expected_n_pool, (
+            f"n_pool={audio_embeddings.shape[0]} != len(val_dataset)={expected_n_pool}"
+        )
 
-    metrics = retrieval_recall_at_k(
+    metrics = retrieval_metrics(
         audio_embeddings,
         video_embeddings,
         ks=cfg.validation.retrieval_top_k,
     )
+    # Log scalars only (hit vectors are lists, not loggable scalars).
+    scalar_metrics = {
+        k: v
+        for k, v in metrics.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
     log_metrics(
         step,
-        metrics,
+        scalar_metrics,
         tb_writer=tb_writer,
         wandb_run=wandb_run,
         logger=logger,
         prefix="retrieval/",
     )
+
+    hits5_sum = metrics.get("a2v_hits@5", 0) + metrics.get("v2a_hits@5", 0)
+    logger.info(
+        f"Retrieval n_pool={metrics['n_pool']} "
+        f"a2v_hits@1/5/10={metrics.get('a2v_hits@1')}/{metrics.get('a2v_hits@5')}/{metrics.get('a2v_hits@10')} "
+        f"v2a_hits@1/5/10={metrics.get('v2a_hits@1')}/{metrics.get('v2a_hits@5')}/{metrics.get('v2a_hits@10')} "
+        f"hits5_sum={hits5_sum}"
+    )
+
+    # Optional embedding dump (off by default) for offline diagnostics.
+    if cfg.validation.get("dump_embeddings", False):
+        dump_path = os.path.join(
+            cfg.training.checkpoint_dir,
+            f"val_embeddings_epoch{epoch}.pt" if epoch is not None else "val_embeddings.pt",
+        )
+        os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
+        torch.save(
+            {
+                "audio": audio_embeddings.cpu(),
+                "video": video_embeddings.cpu(),
+                "n_pool": int(metrics["n_pool"]),
+                "epoch": epoch,
+            },
+            dump_path,
+        )
+        logger.info(f"Dumped validation embeddings to {dump_path}")
+
     return metrics
 
 
@@ -590,20 +832,86 @@ def main(cfg: DictConfig):
     # Otherwise, load manifest once and split into train/val at the video
     # level so no film appears in both (prevents leakage). split_ratio=0
     # disables the split and evaluates on the training set (legacy behavior).
+    original_cwd = get_original_cwd()
+    val_manifest_path = cfg.dataset.get("val_manifest_path", None)
+    # Audio window alignment (defect fix). Historical default was the buggy
+    # keyframe pre-roll (false); runs logged before 2026-09-16 used false.
+    audio_align_to_start = bool(cfg.dataset.get("audio_align_to_start", True))
+    logger.info(
+        "Audio window alignment: "
+        + (
+            "timestamp-accurate, starts at start_sec (audio_align_to_start=true)"
+            if audio_align_to_start
+            else "legacy keyframe pre-roll retained (audio_align_to_start=false, bug-compatible)"
+        )
+    )
     train_items, val_items = None, []
     if cfg.dataset.dummy:
         logger.info("Dummy mode: skipping manifest load (random tensors)")
     else:
+        manifest_sha = _sha256_file(cfg.dataset.manifest_path)
         with open(cfg.dataset.manifest_path, "r", encoding="utf-8") as _f:
             full_manifest = json.load(_f)
-        val_ratio = cfg.validation.get("split_ratio", 0.0)
-        split_seed = cfg.validation.get("split_seed", 42)
-        train_items, val_items = _split_manifest_by_video(full_manifest, val_ratio, split_seed)
         logger.info(
-            f"Manifest split: {len(train_items)} train / {len(val_items)} val segments "
-            f"(val_ratio={val_ratio}, seed={split_seed}, "
-            f"videos={len({i.get('video_id') for i in full_manifest})})"
+            f"Training manifest sha256: {manifest_sha} ({cfg.dataset.manifest_path})"
         )
+        # Optional movie-level dedup mapping: group ids that are copies/parts of
+        # one film so they cannot straddle the train/val boundary.
+        dedup_report_path = cfg.dataset.get("dedup_report_path", None)
+        movie_key_map = None
+        if dedup_report_path:
+            dedup_path = _resolve_path(dedup_report_path, original_cwd)
+            movie_key_map = _load_movie_key_map(dedup_path)
+            logger.info(
+                f"Dedup/movie-key map sha256: {_sha256_file(dedup_path)} "
+                f"({dedup_path}, {len(movie_key_map)} ids)"
+            )
+        logger.info(
+            "Hold-out grouping: "
+            + ("movie_key (dedup report)" if movie_key_map else "video_id")
+        )
+        if val_manifest_path:
+            # Frozen validation pool: no runtime split. Hold out the pool's
+            # movies from training so no film leaks into both sides.
+            pool_path = _resolve_path(val_manifest_path, original_cwd)
+            pool_sha = _sha256_file(pool_path)
+            with open(pool_path, "r", encoding="utf-8") as _f:
+                val_items = json.load(_f)
+            pool_keys = {_group_key(i, movie_key_map) for i in val_items}
+            train_items = [
+                i
+                for i in full_manifest
+                if _group_key(i, movie_key_map) not in pool_keys
+            ]
+            logger.info(
+                f"Validation pool sha256: {pool_sha} ({pool_path}, "
+                f"{len(val_items)} segments, {len(pool_keys)} movies)"
+            )
+            dropped = len(full_manifest) - len(train_items)
+            logger.info(
+                f"Frozen pool holds out {len(pool_keys)} movies; "
+                f"removed {dropped} segments from training"
+            )
+            logger.info(
+                f"Frozen pool split: {len(train_items)} train / {len(val_items)} val "
+                f"segments (runtime split skipped)"
+            )
+        else:
+            val_ratio = cfg.validation.get("split_ratio", 0.0)
+            split_seed = cfg.validation.get("split_seed", 42)
+            train_items, val_items = _split_manifest_by_video(
+                full_manifest, val_ratio, split_seed, movie_key_map
+            )
+            n_units = len({_group_key(i, movie_key_map) for i in full_manifest})
+            logger.info(
+                f"Manifest split: {len(train_items)} train / {len(val_items)} val segments "
+                f"(val_ratio={val_ratio}, seed={split_seed}, "
+                f"{'movies' if movie_key_map else 'videos'}={n_units})"
+            )
+            logger.info(
+                "Validation pool: runtime split (dataset.val_manifest_path is null); "
+                "no frozen sha256"
+            )
         if not val_items:
             logger.warning("Validation split is empty — retrieval eval will run on the TRAIN set")
 
@@ -615,6 +923,7 @@ def main(cfg: DictConfig):
         max_duration=cfg.dataset.max_duration,
         dummy=cfg.dataset.dummy,
         manifest_items=train_items,
+        audio_align_to_start=audio_align_to_start,
     )
     # Under DDP, use a DistributedSampler (disjoint shards per rank). The
     # sampler handles shuffling; DataLoader.shuffle must be False when a
@@ -660,11 +969,17 @@ def main(cfg: DictConfig):
             max_duration=cfg.dataset.max_duration,
             dummy=cfg.dataset.dummy,
             manifest_items=val_items,
+            audio_align_to_start=audio_align_to_start,
         )
         if is_ddp:
-            val_sampler = DistributedSampler(
-                val_dataset, shuffle=False, drop_last=False
-            )
+            if len(val_dataset) < world_size:
+                raise ValueError(
+                    f"validation pool ({len(val_dataset)}) smaller than world_size "
+                    f"({world_size}); strided eval needs at least one sample per rank"
+                )
+            # Exact strided partition: rank r gets r, r+W, r+2W, ... No padding
+            # and no duplicated samples (DistributedSampler would pad shards).
+            val_sampler = StridedSampler(val_dataset, rank=rank, world_size=world_size)
             val_shuffle = False
         else:
             val_sampler = None
@@ -890,6 +1205,27 @@ def main(cfg: DictConfig):
                 scheduler.base_lrs[i] = encoder_lr
                 break
 
+    # Frozen-pool checkpoint selection (opt-in). When disabled, the legacy
+    # "max metric" rule is used and behaviour is unchanged.
+    frozen_selection = bool(cfg.validation.get("enable_frozen_selection", False))
+    min_improve_sigma = float(cfg.validation.get("min_improve_sigma", 2.0))
+    history_path_cfg = cfg.validation.get("history_path", None)
+    history_path = (
+        _resolve_path(history_path_cfg, original_cwd)
+        if history_path_cfg
+        else os.path.join(cfg.training.checkpoint_dir, "val_history.json")
+    )
+    candidate_path = os.path.join(cfg.training.checkpoint_dir, "checkpoint_best_candidate.pth")
+    trailing = []  # [(epoch, hits5_sum)] for the trailing-3-epoch rule
+    best_trailing_mean = float("-inf")
+    winner_epoch = -1
+    if frozen_selection:
+        select_metric = "hits5_sum"
+        logger.info(
+            f"Frozen-pool selection ENABLED: select_metric=hits5_sum, "
+            f"min_improve_sigma={min_improve_sigma}, history={history_path}"
+        )
+
     # Training loop
     for epoch in range(start_epoch, cfg.training.num_epochs + 1):
         if train_sampler is not None:
@@ -937,20 +1273,44 @@ def main(cfg: DictConfig):
                 val_sampler.set_epoch(epoch)
             val_metrics = evaluate_retrieval(
                 cfg, eval_model, val_dataloader, device, logger, tb_writer, wandb_run, global_step,
-                is_ddp=is_ddp, val_sampler=val_sampler,
+                is_ddp=is_ddp, val_sampler=val_sampler, epoch=epoch,
             )
             # Track best checkpoint by the configured selection metric.
             # Default select_metric="mean_r1" = (a2v_r@1 + v2a_r@1)/2.
             if val_metrics:
-                sel = cfg.validation.get("select_metric", "mean_r1")
-                if sel == "mean_r1":
-                    m = (val_metrics.get("a2v_r@1", 0.0) + val_metrics.get("v2a_r@1", 0.0)) / 2.0
+                sel = "hits5_sum" if frozen_selection else cfg.validation.get("select_metric", "mean_r1")
+                m = _selection_metric_value(val_metrics, sel)
+                is_writer = not is_ddp or rank == 0
+                n_pool = int(val_metrics.get("n_pool", 0))
+
+                # Record every eval (metric scalars + per-query hit vectors).
+                if is_writer:
+                    _append_val_history(history_path, epoch, val_metrics)
+
+                new_trailing_leader = False
+                if frozen_selection:
+                    h5 = _selection_metric_value(val_metrics, "hits5_sum")
+                    trailing.append((epoch, h5))
+                    tmean = _trailing_mean(trailing, epoch, window=3)
+                    if tmean > best_trailing_mean:
+                        best_trailing_mean = tmean
+                        winner_epoch = epoch
+                        new_trailing_leader = True
+
+                # Live update rule. Legacy: any improvement. Frozen: require the
+                # new hits5_sum to beat the incumbent by min_improve_sigma
+                # binomial sigma (sigma = sqrt(n*p*(1-p)) from the incumbent's
+                # own rate p), so a fluke does not become "best".
+                if frozen_selection:
+                    accept = _frozen_live_accept(
+                        m, best_metric, best_epoch, n_pool, min_improve_sigma
+                    )
                 else:
-                    m = val_metrics.get(sel, 0.0)
-                if m > best_metric:
+                    accept = m > best_metric
+                if accept:
                     best_metric = m
                     best_epoch = epoch
-                    if not is_ddp or rank == 0:
+                    if is_writer:
                         best_path = os.path.join(cfg.training.checkpoint_dir, "checkpoint_best.pth")
                         _save_checkpoint(
                             best_path, model, optimizer, scheduler, scaler,
@@ -958,6 +1318,19 @@ def main(cfg: DictConfig):
                             cfg, is_ddp,
                         )
                         logger.info(f"New best {sel}={best_metric:.4f} @ epoch {epoch} — saved {best_path}")
+
+                # Save the trailing-3 leader's state AFTER the live update so the
+                # candidate checkpoint carries current best_metric/best_epoch.
+                if frozen_selection and new_trailing_leader and is_writer:
+                    _save_checkpoint(
+                        candidate_path, model, optimizer, scheduler, scaler,
+                        epoch, global_step, best_metric, best_epoch, sel,
+                        cfg, is_ddp,
+                    )
+                    logger.info(
+                        f"Post-hoc leader epoch {epoch}: trailing-3 mean "
+                        f"hits5_sum={best_trailing_mean:.1f}"
+                    )
 
         # Save latest checkpoint (every epoch, rank 0 only under DDP).
         # Full state for crash recovery. Barrier ensures all ranks wait for save.
@@ -972,8 +1345,32 @@ def main(cfg: DictConfig):
         if is_ddp:
             dist.barrier()
 
-    logger.info(f"Best val {cfg.validation.get('select_metric', 'mean_r1')}={best_metric:.4f} at epoch {best_epoch}")
+    best_sel_name = "hits5_sum" if frozen_selection else cfg.validation.get("select_metric", "mean_r1")
+    logger.info(f"Best val {best_sel_name}={best_metric:.4f} at epoch {best_epoch}")
     logger.info("Training finished")
+
+    # Post-hoc selection: pick the epoch with the maximal trailing-3-epoch mean
+    # of hits5_sum (ties go to the earlier epoch) and rewrite checkpoint_best.pth
+    # if it differs from the live best. Runs on rank 0 only.
+    if frozen_selection:
+        best_path = os.path.join(cfg.training.checkpoint_dir, "checkpoint_best.pth")
+        is_writer = not is_ddp or rank == 0
+        if is_writer:
+            if winner_epoch > 0 and winner_epoch != best_epoch:
+                if os.path.exists(candidate_path):
+                    os.replace(candidate_path, best_path)
+                    logger.info(
+                        f"Post-hoc selection: epoch {winner_epoch} (trailing-3 mean "
+                        f"hits5_sum={best_trailing_mean:.1f}) differs from live best "
+                        f"epoch {best_epoch}; rewrote {best_path}"
+                    )
+                else:
+                    logger.warning(
+                        f"Post-hoc winner epoch {winner_epoch} has no candidate "
+                        f"checkpoint at {candidate_path}; keeping live best"
+                    )
+            elif os.path.exists(candidate_path):
+                os.remove(candidate_path)
 
     # Save final checkpoint (rank 0 only under DDP). Full state for resume/inference.
     if not is_ddp or rank == 0:
