@@ -1,10 +1,31 @@
 logdir/*
 data/*
+# The frozen validation pool's hash is a reproducibility anchor: two runs are
+# comparable only if it matches, so the hash is versioned while the pool is not.
+!data/val_pool.sha256
 uv.lock
 AGENTS.md
 cache/*
 outputs/*
 slurm_job_scripts/*
+perturbation_results/*
+qc_results/*
+qc_results_ws/*
+logs/*
+!logs/.gitkeep
+
+# Model checkpoints: multi-GB weight files, never commit (4.2G + 6.3G locally)
+checkpoints/
+checkpoints-*/
+
+# Local agent tooling state
+.cortexkit/
+
+# Working notes: internal, must not be published to the public repo
+docs/STATUS.md
+docs/MEETING_*.md
+docs/PREPROCESSING_REVIEW.md
+SESSION_BRIDGE.md
 
 
 # Byte-compiled / optimized / DLL files
@@ -224,3 +245,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 out
+
+# Vendored reference implementations (read-only; Apache-2.0)
+vendor/
