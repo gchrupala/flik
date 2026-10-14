@@ -110,7 +110,11 @@ All configuration is in `src/configs/default.yaml`. Key sections:
 | `eval_every_n_epochs` | 1 | Run retrieval eval every N epochs (always on last epoch; 1 = every epoch) |
 | `run_retrieval_eval` | true | Enable retrieval evaluation (frequency controlled by `eval_every_n_epochs`) |
 
-> **Multi-node config**: Use `--config-name=multinode` for 4+ GPU DDP runs. It inherits `default.yaml` and raises `log_frequency` to 50, `eval_every_n_epochs` to 5, and `eval_batch_size` to 64 — less verbose logging and fewer/cheaper evals suited to the shorter per-rank epochs and larger global batch.
+> **Multi-node config**: Use `--config-name=multinode` for 4+ GPU DDP runs. It inherits `default.yaml` and overrides:
+> - `batch_size` 64→128 (more negatives per DCL step; drop to 96 if OOM)
+> - `num_workers` 12→4, `prefetch_factor` 4→2 (saves ~90 GB CPU RAM; data_time was ~0.06s vs ~10s forward — massively over-provisioned). Reduced from 8→4 after a thread-exhaustion crash on Purpureus (see [Thread limits on shared clusters](#thread-limits-on-shared-clusters)).
+> - `log_frequency` 10→50, `eval_every_n_epochs` 1→5, `eval_batch_size` 16→64 (less verbose, fewer/cheaper evals)
+> - `use_wandb` false→true
 
 ### Optimizer (`optimizer.*`)
 
@@ -210,13 +214,28 @@ Gradient checkpointing is enabled by default on CUDA (`gradient_checkpointing: t
 
 Several optimizations keep the GPU fed:
 
-- **Video decoding** (`src/utils/video.py`): Sequential frame read in a single pass (no per-frame seeking), plus vectorized numpy resize/crop/normalize instead of per-frame PIL transforms. ~2.4× faster than the previous approach.
+- **Video decoding** (`src/utils/video.py`): Sequential frame read in a single pass (no per-frame seeking), plus vectorized numpy resize/crop/normalize instead of per-frame PIL transforms. ~2.4× faster than the previous approach. OpenCV's internal parallel-for thread pool is disabled via `cv2.setNumThreads(0)` at module load — DataLoader workers are already separate processes, so per-worker threads only exhaust the cgroup thread limit (see [Thread limits on shared clusters](#thread-limits-on-shared-clusters)).
 - **Audio decoding** (`src/utils/audio.py`): Tolerant of corrupt AAC frames — skips bad frames and returns partial audio instead of failing. libav warning logs suppressed.
-- **DataLoader**: 12 workers with `persistent_workers=true` (workers stay alive across epochs) and `prefetch_factor=4` (prefetch batches to keep GPU fed).
+- **DataLoader**: 12 workers with `persistent_workers=true` (workers stay alive across epochs) and `prefetch_factor=4` (prefetch batches to keep GPU fed). Reduced to 4 in `multinode.yaml` to stay under shared-cluster thread limits.
 - **Dataset retry**: On load failure, retries with a different random segment (up to 3 attempts) before raising. Prevents single corrupt files from crashing training.
 - **cudnn benchmark**: Enabled on CUDA for consistent input sizes (video frames are always 224×224).
 
 Monitor `train/data_time_avg` — if it exceeds `train/forward_time_avg`, the GPU is data-starved and you should increase `num_workers` or `prefetch_factor`.
+
+#### Thread limits on shared clusters
+
+On SLURM-managed clusters (Purpureus, Snellius), the cgroup `ulimit -u` (max processes/threads per user) is much lower than on a workstation. Each DataLoader worker process spawns threads from two sources:
+
+1. **OpenCV parallel-for pool** — `cv2.resize`/`cv2.cvtColor` use a thread pool defaulting to all CPU cores. With 4 ranks × 8 workers = 32 workers, this spawned 125+ threads per worker and exhausted the limit (`res = 11` / `EAGAIN` from `pthread_create`).
+2. **FFmpeg decode threads** — each `cv2.VideoCapture()` open spawns h264 decode threads.
+
+The fixes (all required, applied together):
+- `cv2.setNumThreads(0)` in `src/utils/video.py` — OpenCV ops run in the calling thread, no pool spawned. Correct because parallelism comes from multiple worker *processes*, not threads within each.
+- `OPENCV_FFMPEG_THREADS=1` in the SLURM script — caps FFmpeg to 1 decode thread per VideoCapture (not auto-detected).
+- `ulimit -u 65536` in the SLURM script — raises the cgroup limit as a safety net.
+- `num_workers` 8→4 in `multinode.yaml` — halves the process count (32→16) as defense in depth.
+
+Symptom: `RuntimeError: can't start new thread` from `multiprocessing/queues.py` + `Could not open codec h264, error: -11` from OpenCV (the h264 error is a *consequence* — FFmpeg couldn't spawn its threads because the process was already at the limit, not a codec problem).
 
 ## Monitoring
 
@@ -345,6 +364,11 @@ Paste this block into your own `#SBATCH` script, after the directives and
 export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true
 export LD_LIBRARY_PATH=$(uv run --extra cu128 python -c "import site; print(site.getsitepackages()[0] + '/nvidia/cudnn/lib')"):$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=$(uv run --extra cu128 python -c "import site; print(site.getsitepackages()[0] + '/nvidia/cublas/lib')"):$LD_LIBRARY_PATH
+
+# Thread limits (required on shared clusters — see "Thread limits on shared clusters")
+export OMP_NUM_THREADS=1            # GPU-bound training; prevents BLAS oversubscription
+export OPENCV_FFMPEG_THREADS=1      # 1 FFmpeg decode thread per VideoCapture (not auto)
+ulimit -u 65536 2>/dev/null || true  # raise cgroup thread limit (defaults are low on SLURM)
 
 cd "$SLURM_SUBMIT_DIR"
 uv sync --extra cu128
